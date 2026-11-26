@@ -57,7 +57,27 @@ LOQ Center loads every plugin in `~/.config/loq-center/plugins/*.py`. Without `l
 
 Run as your normal user, not with `sudo`. The scripts ask for `sudo` only where needed: the root helper, the Polkit policy, kernel module packages and udev rules.
 
-### 1. Clone and run
+### 1. One command
+
+Paste this in a terminal. It downloads and runs the installer, with no clone and no folder:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/aditandava/LOQ-controler-linux/main/loq_controller_install.sh)
+```
+
+### 2. Optional: RGB keyboard
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/aditandava/LOQ-controler-linux/main/loq_rgb.sh)
+```
+
+Both in one go:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/aditandava/LOQ-controler-linux/main/loq_controller_install.sh) && bash <(curl -fsSL https://raw.githubusercontent.com/aditandava/LOQ-controler-linux/main/loq_rgb.sh)
+```
+
+Prefer to read the scripts first? Clone the repo and run them yourself:
 
 ```bash
 git clone https://github.com/aditandava/LOQ-controler-linux.git
@@ -65,11 +85,7 @@ cd LOQ-controler-linux
 bash loq_controller_install.sh
 ```
 
-### 2. Optional: RGB keyboard
-
-```bash
-bash loq_rgb.sh
-```
+Uninstall the same way, adding `--uninstall` inside the command: `bash <(curl -fsSL <script link>) --uninstall`.
 
 Close and reopen LOQ Center to see the **LOQ RGB** tab.
 
@@ -94,13 +110,11 @@ If you do not use Hyprland or HyDE, LOQ Center still installs. These parts are s
 
 ## Ubuntu, Debian, Fedora and openSUSE
 
-The installer detects your package manager, so the same two commands work:
+The installer detects your package manager, so the same one command works. Make sure `curl` is installed first (Fedora: `dnf`, openSUSE: `zypper`):
 
 ```bash
-sudo apt install git        # Ubuntu / Debian (Fedora: dnf, openSUSE: zypper)
-git clone https://github.com/aditandava/LOQ-controler-linux.git
-cd LOQ-controler-linux
-bash loq_controller_install.sh
+sudo apt install -y curl
+bash <(curl -fsSL https://raw.githubusercontent.com/aditandava/LOQ-controler-linux/main/loq_controller_install.sh)
 ```
 
 It is written for Arch / EndeavourOS, so on other distros note these differences:
