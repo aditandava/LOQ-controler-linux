@@ -1,0 +1,2440 @@
+#!/usr/bin/python3
+# Copyright (C) 2026 aditandava
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""LOQ Center: a control panel for Lenovo LOQ and Legion laptops on Linux.
+
+Everything shown is detected at runtime. A control only appears when the kernel
+or a tool on this machine really provides it.
+"""
+import colorsys
+import fcntl
+import hashlib
+import importlib.util
+import json
+import math
+import os
+import random
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import zlib
+from pathlib import Path
+
+VERSION = "1.17"
+SYS = Path("/sys")
+PROC = Path("/proc")
+HELPER = "/usr/local/libexec/loq-center-helper"
+COOLING_STATE = Path("/run/loq-center-cooling.json")
+MUX_PENDING = Path("/run/loq-center-mux")  # written by the helper until the next reboot
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+PLUGIN_DIR = CONFIG_DIR / "loq-center" / "plugins"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+LOG_FILE = CACHE_DIR / "loq-center" / "log"
+THEME_FILE = CONFIG_DIR / "loq-center" / "theme.css"
+HYPRIDLE_CONF = CONFIG_DIR / "hypr" / "hypridle.conf"
+HYPRIDLE_SHARE = DATA_DIR / "hypr" / "hypridle.conf"
+
+CHARGE_LABELS = {"Long_Life": "Battery care", "Standard": "Full charge", "Fast": "Rapid charge"}
+PROFILE_LABELS = {
+    "low-power": "Quiet", "quiet": "Quiet", "cool": "Cool", "balanced": "Balanced",
+    "balanced-performance": "Balanced+", "performance": "Performance", "max-power": "Max power",
+    "cooling": "Cooling", "ultra-saver": "Ultra saver", "custom": "Custom",
+}
+CHARGER_ONLY = ("performance", "max-power", "cooling")  # not offered on battery
+PPD_NAMES = {"low-power": "power-saver", "balanced": "balanced", "performance": "performance"}
+TOGGLE_LABELS = {"fn_lock": "Fn lock", "camera_power": "Camera"}
+
+# Sleep presets in minutes: (label, dim_sec, lock_sec, dpms_sec, suspend_sec)
+IDLE_PRESETS = {
+    5:  ("5 min",  120,  180,  240,  300),
+    10: ("10 min", 300,  480,  540,  600),
+    30: ("30 min", 600, 1200, 1500, 1800),
+    0:  ("Never",    0,    0,    0,    0),
+}
+
+DEFAULT_HYPRIDLE_TEMPLATE = """$LOCKSCREEN = hyprlock
+
+general {
+    lock_cmd = $LOCKSCREEN
+    unlock_cmd =
+    before_sleep_cmd = loginctl lock-session
+    after_sleep_cmd = hyprctl dispatch dpms on
+    ignore_dbus_inhibit = false
+}
+
+listener {
+    timeout = 120
+    on-timeout = brightnessctl -s && brightnessctl s 1%
+    on-resume = brightnessctl -r
+}
+
+listener {
+    timeout = 180
+    on-timeout = loginctl lock-session
+}
+
+listener {
+    timeout = 240
+    on-timeout = hyprctl dispatch dpms off
+    on-resume = hyprctl dispatch dpms on
+}
+
+listener {
+    timeout = 300
+    on-timeout = systemctl suspend
+}
+"""
+
+
+class ActionError(Exception):
+    """A user-facing failure message."""
+
+
+# ---------------------------------------------------------------- basic helpers
+
+def read(path):
+    try:
+        return Path(path).read_text().strip()
+    except (OSError, UnicodeError):
+        return None
+
+
+def read_int(path):
+    try:
+        return int(read(path))
+    except (TypeError, ValueError):
+        return None
+
+
+def log(message):
+    """Append a line to ~/.cache/loq-center/log (kept small). Never raises."""
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > 200_000:
+            LOG_FILE.replace(LOG_FILE.with_suffix(".old"))
+        with LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except OSError:
+        pass
+
+
+def run(cmd, timeout=15):
+    """Run a command and never raise. Returns (code, stdout, stderr)."""
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
+        return done.returncode, done.stdout.strip(), done.stderr.strip()
+    except FileNotFoundError:
+        return 127, "", f"{cmd[0]} is not installed"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{cmd[0]} did not answer in time"
+    except OSError as err:
+        return 126, "", str(err)
+
+
+def have(tool):
+    return shutil.which(tool) is not None
+
+
+def helper(*args, timeout=120):
+    """Run the root helper through polkit. timeout=None means never interrupt it."""
+    if not os.path.exists(HELPER):
+        raise ActionError("Root helper is missing. Run the installer again.")
+    code, out, err = run(["pkexec", HELPER, *args], timeout=timeout)
+    if code == 0:
+        return out
+    log(f"helper {' '.join(args)} -> code {code}: {err or out}")
+    if code == 126:
+        raise ActionError("Authentication was cancelled.")
+    if code == 127:
+        raise ActionError(err or "Not authorised. Is a polkit agent running?")
+    raise ActionError(err or out or f"Helper failed with code {code}.")
+
+
+# ---------------------------------------------------------------------- battery
+
+def batteries():
+    found = []
+    for dev in sorted((SYS / "class/power_supply").glob("*")):
+        if read(dev / "type") == "Battery" and dev.name.startswith("BAT"):
+            found.append(dev)
+    return found
+
+
+def battery_info():
+    bats = batteries()
+    if not bats:
+        return None
+    bat = bats[0]
+    watts = None
+    power = read_int(bat / "power_now")
+    if power is None:
+        current, volts = read_int(bat / "current_now"), read_int(bat / "voltage_now")
+        if current is not None and volts is not None:
+            power = abs(current) * volts / 1_000_000
+    if power is not None:
+        watts = abs(power) / 1_000_000
+    health = None
+    for kind in ("energy", "charge"):
+        full, design = read_int(bat / f"{kind}_full"), read_int(bat / f"{kind}_full_design")
+        if full and design:
+            health = min(100.0, full * 100 / design)
+            break
+    cycles = read_int(bat / "cycle_count")
+    return {
+        "capacity": read_int(bat / "capacity"),
+        "status": read(bat / "status") or "Unknown",
+        "watts": watts,
+        "health": health,
+        "cycles": cycles if cycles else None,
+    }
+
+
+def on_ac():
+    for dev in (SYS / "class/power_supply").glob("*"):
+        if read(dev / "type") == "Mains":
+            return read(dev / "online") == "1"
+    return None
+
+
+def ideapad_dir():
+    found = sorted((SYS / "bus/platform/drivers/ideapad_acpi").glob("VPC2004:*"))
+    return found[0] if found else None
+
+
+def charge_info():
+    """Returns {"options": [...], "active": name or None, "note": str} or None."""
+    for bat in batteries():
+        node = bat / "charge_types"
+        if not node.exists():
+            continue
+        text = read(node)
+        if text is None:
+            return {"options": ["Long_Life", "Standard", "Fast"], "active": None,
+                    "note": "The firmware reports conflicting charge modes (seen after hibernate). "
+                            "Choose a mode to repair it."}
+        active = re.search(r"\[([^\]]+)\]", text)
+        options = [o for o in text.replace("[", "").replace("]", "").split() if o in CHARGE_LABELS]
+        if options:
+            return {"options": options, "active": active.group(1) if active else None, "note": ""}
+    dev = ideapad_dir()
+    if dev and (dev / "conservation_mode").exists():
+        value = read(dev / "conservation_mode")
+        active = {"1": "Long_Life", "0": "Standard"}.get(value)
+        return {"options": ["Long_Life", "Standard"], "active": active, "note": ""}
+    return None
+
+
+def charge_note(charge, battery, ac):
+    """Explains the selected mode and what the battery is really doing."""
+    if charge["note"]:
+        return charge["note"]
+    active = charge["active"]
+    if active is None:
+        return "The current charging mode could not be read."
+    level = battery["capacity"] if battery else None
+    if active == "Long_Life":
+        text = "Battery care: stops at a Lenovo firmware limit (about 80% on many LOQ models)."
+    else:
+        text = ("Rapid charge: goes to 100%, faster mainly at lower levels." if active == "Fast"
+                else "Full charge: goes to 100%.")
+        if ac is False:
+            text += " Plug in the charger."
+        elif level is not None and level < 95 and battery["status"] != "Charging":
+            text += " Not charging: unplug the charger for 10 seconds, then plug it in again."
+    if level is not None:
+        text += f"\nNow: {level}% · {battery['status']}"
+    return text
+
+
+def set_charge(mode):
+    helper("set", "charge", mode)
+    return f"Charging mode: {CHARGE_LABELS.get(mode, mode)}"
+
+
+# ----------------------------------------------------------- hypridle sleep timer
+
+def hypridle_running():
+    code, _, _ = run(["pgrep", "-x", "hypridle"], timeout=3)
+    return code == 0
+
+
+def ensure_hypridle_conf():
+    if HYPRIDLE_CONF.exists():
+        return HYPRIDLE_CONF.read_text(errors="replace")
+    HYPRIDLE_CONF.parent.mkdir(parents=True, exist_ok=True)
+    if HYPRIDLE_SHARE.exists():
+        text = HYPRIDLE_SHARE.read_text(errors="replace")
+    else:
+        text = DEFAULT_HYPRIDLE_TEMPLATE
+    HYPRIDLE_CONF.write_text(text)
+    return text
+
+
+def classify_listener(block):
+    low = block.lower()
+    if "suspend" in low:
+        return "suspend"
+    if "dpms" in low:
+        return "dpms"
+    if "lock" in low:
+        return "lock"
+    if "brightnessctl" in low:
+        return "dim"
+    return "other"
+
+
+def idle_info():
+    """Detects current sleep timeout in minutes (5, 10, 30, or 0 for Never)."""
+    if not have("hypridle"):
+        return None
+    if not hypridle_running():
+        return {"active": 0, "note": "Idle timer is off (hypridle stopped). Screen will not lock or sleep automatically."}
+    conf_path = HYPRIDLE_CONF if HYPRIDLE_CONF.exists() else HYPRIDLE_SHARE
+    text = read(conf_path) or ""
+    listeners = re.findall(r"listener\s*\{[^}]*\}", text, re.S)
+    suspend_sec = None
+    max_sec = 0
+    for block in listeners:
+        m = re.search(r"timeout\s*=\s*(\d+)", block)
+        if not m:
+            continue
+        sec = int(m.group(1))
+        max_sec = max(max_sec, sec)
+        if classify_listener(block) == "suspend":
+            suspend_sec = sec
+    target_sec = suspend_sec if suspend_sec is not None else max_sec
+    mins = round(target_sec / 60) if target_sec else 0
+    active = mins if mins in (5, 10, 30) else None
+    detail = f"Sleep after {mins} min of inactivity." if mins else "Custom hypridle timer active."
+    return {"active": active, "note": f"{detail} Stages: dim → lock (hyprlock) → screen off → sleep."}
+
+
+def restart_hypridle():
+    code, _, _ = run(["systemctl", "--user", "list-unit-files", "hypridle.service"], timeout=4)
+    if code == 0:
+        r_code, _, _ = run(["systemctl", "--user", "restart", "hypridle.service"], timeout=5)
+        if r_code == 0 and hypridle_running():
+            return
+    run(["pkill", "-x", "hypridle"], timeout=3)
+    time.sleep(0.15)
+    subprocess.Popen(["hypridle"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def stop_hypridle():
+    run(["systemctl", "--user", "stop", "hypridle.service"], timeout=4)
+    run(["pkill", "-x", "hypridle"], timeout=3)
+
+
+def set_idle(minutes):
+    if not have("hypridle"):
+        raise ActionError("hypridle is not installed.")
+    minutes = int(minutes)
+    if minutes not in IDLE_PRESETS:
+        raise ActionError("Unsupported sleep timer value.")
+    if minutes == 0:
+        stop_hypridle()
+        return "Sleep timer: Never (hypridle stopped)"
+
+    _, dim_s, lock_s, dpms_s, susp_s = IDLE_PRESETS[minutes]
+    stage_map = {"dim": dim_s, "lock": lock_s, "dpms": dpms_s, "suspend": susp_s}
+    fallback_order = [dim_s, lock_s, dpms_s, susp_s]
+
+    text = ensure_hypridle_conf()
+    idx = 0
+
+    def repl(match):
+        nonlocal idx
+        block = match.group(0)
+        kind = classify_listener(block)
+        new_timeout = stage_map.get(kind, fallback_order[min(idx, len(fallback_order) - 1)])
+        idx += 1
+        return re.sub(r"(timeout\s*=\s*)\d+", rf"\g<1>{new_timeout}", block, count=1)
+
+    updated, count = re.subn(r"listener\s*\{[^}]*\}", repl, text, flags=re.S)
+    if count == 0:
+        updated = DEFAULT_HYPRIDLE_TEMPLATE
+        updated = re.sub(r"listener\s*\{[^}]*\}", repl, updated, flags=re.S)
+    elif "suspend" not in updated.lower():
+        updated = updated.rstrip() + f"\n\nlistener {{\n    timeout = {susp_s}\n    on-timeout = systemctl suspend\n}}\n"
+
+    try:
+        HYPRIDLE_CONF.write_text(updated)
+    except OSError as err:
+        raise ActionError(f"Could not write {HYPRIDLE_CONF}: {err}")
+
+    restart_hypridle()
+    return f"Sleep timer set to {minutes} min (dim {dim_s // 60}m, lock {lock_s // 60}m, sleep {minutes}m)"
+
+
+# ------------------------------------------------------------------ performance
+
+def platform_profile_nodes():
+    """(profile_path, choices_path). The Lenovo class device comes first, then the legacy ACPI file."""
+    found = []
+    for d in (SYS / "class/platform-profile").glob("platform-profile-*"):
+        p, c = d / "profile", d / "choices"
+        if p.exists() and c.exists():
+            name = (read(d / "name") or "").lower()
+            other = not any(k in name for k in ("lenovo", "ideapad", "legion"))
+            found.append((other, "custom" not in (read(c) or "").split(), d.name, p, c))
+    found.sort()
+    if found and not found[0][0]:
+        return found[0][3], found[0][4]
+    legacy_p = SYS / "firmware/acpi/platform_profile"
+    legacy_c = SYS / "firmware/acpi/platform_profile_choices"
+    if legacy_p.exists() and legacy_c.exists():
+        return legacy_p, legacy_c
+    return (found[0][3], found[0][4]) if found else (None, None)
+
+
+def cooling_available():
+    node, _ = platform_profile_nodes()
+    if node is not None or have("powerprofilesctl"):
+        return True
+    if any((SYS / "devices/system/cpu/cpufreq").glob("policy*")):
+        return True
+    if any((SYS / "class/powercap").glob("intel-rapl*")):
+        return True
+    dev = ideapad_dir()
+    return bool(dev and (dev / "fan_mode").exists())
+
+
+def override_state(sys_profile=None):
+    """The helper's record of an active Cooling (or substitute Max power) mode, else None."""
+    try:
+        data = json.loads(read(COOLING_STATE) or "")
+    except ValueError:
+        return None
+    applied = data.get("applied_profile")
+    if sys_profile is not None and applied is not None and sys_profile != applied:
+        return None
+    return data
+
+
+def mode_row(choices):
+    """Always the same order: Quiet, Balanced, Performance, Max power, Cooling, Ultra saver."""
+    quiet = next((c for c in ("low-power", "quiet") if c in choices), None)
+    row = [quiet] if quiet else []
+    row += [c for c in ("balanced", "performance") if c in choices]
+    if "max-power" in choices or "performance" in choices:
+        row.append("max-power")
+    return row + ["cooling", "ultra-saver"]
+
+
+def usable_profiles(options, source):
+    """The modes worth offering for "ac" or "battery"."""
+    return [p for p in options if source != "battery" or p not in CHARGER_ONLY]
+
+
+def _profile_result(choices, current):
+    state = override_state(current)
+    row = mode_row(choices)
+    active = state.get("mode", "cooling") if state else current
+    if active in ("low-power", "quiet"):
+        active = row[0]
+    return {"options": row, "active": active,
+            "fans_direct": bool(state and state.get("fans_direct"))}
+
+
+def profile_info():
+    node, choices_node = platform_profile_nodes()
+    if node is not None:
+        current = read(node)
+        choices = (read(choices_node) or "").split()
+        if current and choices:
+            return _profile_result(choices, current)
+    if have("powerprofilesctl"):
+        code, out, _ = run(["powerprofilesctl", "list"], timeout=5)
+        choices = [k for k, v in PPD_NAMES.items() if re.search(rf"^\*?\s*{v}:", out, re.M)]
+        if code == 0 and choices:
+            _, now, _ = run(["powerprofilesctl", "get"], timeout=5)
+            active = next((k for k, v in PPD_NAMES.items() if v == now), None)
+            info = _profile_result(choices, None)
+            if not override_state():
+                info["active"] = active
+            return info
+    if cooling_available():
+        return _profile_result([], None)
+    return None
+
+
+def set_profile(name):
+    if name in CHARGER_ONLY and on_ac() is False:
+        raise ActionError(f"Plug in the charger to use {PROFILE_LABELS[name]}.")
+    if name in ("cooling", "max-power", "ultra-saver"):
+        out = helper("power", "profile", name)
+        return out or f"Performance mode: {PROFILE_LABELS.get(name, name)}"
+    if COOLING_STATE.exists():  # leaving Cooling or Max power restores the saved settings
+        out = helper("set", "profile", name)
+        return out or f"Performance mode: {PROFILE_LABELS.get(name, name)}"
+    node, _ = platform_profile_nodes()
+    if name in PPD_NAMES and have("powerprofilesctl"):
+        code, _, err = run(["powerprofilesctl", "set", PPD_NAMES[name]])
+        if code == 0 and (node is None or read(node) == name):
+            return f"Performance mode: {PROFILE_LABELS.get(name, name)}"
+        if node is None:
+            raise ActionError(err or "power-profiles-daemon refused the change.")
+    out = helper("set", "profile", name)
+    return out or f"Performance mode: {PROFILE_LABELS.get(name, name)}"
+
+
+# ---------------------------------------------------------------- device toggles
+
+def toggle_info():
+    dev = ideapad_dir()
+    found = {}
+    if dev:
+        for name in TOGGLE_LABELS:
+            value = read(dev / name)
+            if value in ("0", "1"):
+                found[name] = value
+    return found
+
+
+def set_toggle(name, value):
+    helper("set", "toggle", name, value)
+    return f"{TOGGLE_LABELS[name]}: {'on' if value == '1' else 'off'}"
+
+
+# ------------------------------------------------------------------- brightness
+
+def led_info(path):
+    value, top = read_int(path / "brightness"), read_int(path / "max_brightness")
+    if value is None or not top:
+        return None
+    return {"name": path.name, "value": value, "max": top}
+
+
+def backlight_info():
+    if not have("brightnessctl"):
+        return None
+    devices = sorted((SYS / "class/backlight").glob("*"),
+                     key=lambda p: (not p.name.startswith("intel"), p.name))
+    for dev in devices:
+        info = led_info(dev)
+        if info:
+            return info
+    return None
+
+
+def keyboard_info():
+    if not have("brightnessctl"):
+        return None
+    for dev in sorted((SYS / "class/leds").glob("*kbd_backlight*")):
+        info = led_info(dev)
+        if info and info["max"] <= 10:
+            return info
+    return None
+
+
+def set_led(device, value):
+    code, _, err = run(["brightnessctl", "-q", "-d", device, "set", str(value)])
+    if code != 0:
+        raise ActionError(err or "brightnessctl failed.")
+
+
+def set_brightness(percent):
+    info = backlight_info()
+    if not info:
+        raise ActionError("No screen backlight found.")
+    percent = max(5, min(100, int(percent)))
+    set_led(info["name"], f"{percent}%")
+    return f"Brightness: {percent}%"
+
+
+def set_keyboard(level):
+    info = keyboard_info()
+    if not info:
+        raise ActionError("No keyboard backlight found.")
+    set_led(info["name"], int(level))
+    return f"Keyboard light: {level}"
+
+
+# ---------------------------------------------------------------------- display
+
+def monitors():
+    code, out, _ = run(["hyprctl", "-j", "monitors"], timeout=5)
+    if code != 0:
+        return []
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def internal_monitor():
+    return next((m for m in monitors() if str(m.get("name", "")).startswith("eDP")), None)
+
+
+def refresh_options(monitor):
+    """Maps a rounded refresh rate to a Hyprland mode string at the current resolution."""
+    found = {}
+    for mode in monitor.get("availableModes", []):
+        match = re.fullmatch(r"(\d+)x(\d+)@(\d+(?:\.\d+)?)Hz", str(mode))
+        if not match:
+            continue
+        width, height, rate = int(match[1]), int(match[2]), float(match[3])
+        if width == monitor.get("width") and height == monitor.get("height"):
+            found.setdefault(round(rate), f"{width}x{height}@{match[3]}")
+    return dict(sorted(found.items()))
+
+
+def display_info():
+    mon = internal_monitor()
+    if not mon:
+        return None
+    return {"name": mon["name"], "options": refresh_options(mon),
+            "active": round(float(mon.get("refreshRate", 0)))}
+
+
+def set_refresh(rate):
+    mon = internal_monitor()
+    if not mon:
+        raise ActionError("Built-in screen not found in Hyprland.")
+    mode = refresh_options(mon).get(int(rate))
+    name = str(mon["name"])
+    if not mode or not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        raise ActionError(f"{rate} Hz is not available.")
+    position = f"{int(mon.get('x', 0))}x{int(mon.get('y', 0))}"
+    scale = f"{float(mon.get('scale', 1)):g}"
+    turn = int(mon.get("transform", 0))
+    lua = (f'hl.monitor({{ output = "{name}", mode = "{mode}", position = "{position}", '
+           f"scale = {scale}, transform = {turn} }})")
+    legacy = f"{name},{mode},{position},{scale},transform,{turn}"
+    errors = []
+    for cmd in (["hyprctl", "eval", lua], ["hyprctl", "keyword", "monitor", legacy]):
+        code, out, err = run(cmd)
+        errors.append(err or out)
+        for _ in range(10):
+            now = internal_monitor()
+            if now and abs(float(now.get("refreshRate", 0)) - float(rate)) < 1.5:
+                return f"Refresh rate: {rate} Hz (until Hyprland reloads)"
+            if code != 0 or "can't" in out or "error" in out.lower():
+                break
+            time.sleep(0.2)
+    raise ActionError("Hyprland did not change the refresh rate. " + " | ".join(filter(None, errors)))
+
+
+# --------------------------------------------------------------------- graphics
+
+def nvidia_state():
+    """Reads sysfs only, so it never wakes a sleeping GPU."""
+    for dev in (SYS / "bus/pci/devices").glob("*"):
+        if read(dev / "vendor") == "0x10de" and (read(dev / "class") or "").startswith("0x03"):
+            return read(dev / "power/runtime_status") or "unknown"
+    return "off"
+
+
+def panel_on_nvidia():
+    drm = SYS / "class/drm"
+    for connector in drm.glob("card*-eDP-*"):
+        if read(connector / "status") == "connected":
+            if read(drm / connector.name.split("-")[0] / "device/vendor") == "0x10de":
+                return True
+    return False
+
+
+def gpu_mode():
+    if not have("envycontrol"):
+        return None
+    code, out, _ = run(["envycontrol", "--query"])
+    return out if code == 0 and out in ("integrated", "hybrid", "nvidia") else "unknown"
+
+
+def gpu_stats():
+    """Asks nvidia-smi. This wakes the GPU, so it only runs when the user asks."""
+    fields = "temperature.gpu,power.draw,utilization.gpu,memory.used,memory.total"
+    code, out, err = run(["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"])
+    if code != 0 or not out:
+        raise ActionError(err or out or "nvidia-smi failed.")
+    values = [v.strip() for v in out.splitlines()[0].split(",")]
+    if len(values) != 5:
+        raise ActionError("Unexpected nvidia-smi output.")
+    temp, watts, use, used, total = values
+    return f"{temp} °C   {watts} W   {use}% load   {used} / {total} MiB"
+
+
+def set_gpu(mode):
+    return helper("gpu", mode, timeout=None)
+
+
+def set_mux(mode):
+    return helper("gpu", "mux", mode, timeout=None)
+
+
+GPU_LABELS = {"integrated": "Integrated", "hybrid": "Hybrid", "dgpu": "dGPU only"}
+
+
+def graphics_state():
+    pending = read(MUX_PENDING)
+    return {"config": gpu_mode(), "dgpu": panel_on_nvidia(),
+            "pending": pending if pending in ("hybrid", "dgpu") else None}
+
+
+def selected_gpu(state):
+    # No envycontrol and a screen that is not on NVIDIA means plain hybrid
+    return state["pending"] or ("dgpu" if state["dgpu"] else state["config"] or "hybrid")
+
+
+def gpu_action(pick, state):
+    """What a GPU button does: ("none" | "blocked" | "mux" | "envy", message)."""
+    if pick == selected_gpu(state):
+        return "none", f"Already set to {GPU_LABELS[pick]}."
+    if pick == "integrated" and (state["dgpu"] or state["pending"] == "dgpu"):
+        return "blocked", "The screen needs NVIDIA right now. Pick Hybrid and reboot first."
+    if pick == "dgpu":
+        if state["config"] == "integrated" and not state["dgpu"]:
+            return "blocked", "Pick Hybrid and reboot first, then pick dGPU only."
+        return "mux", ""
+    if pick == "hybrid" and (state["dgpu"] or state["pending"]):
+        return "mux", ""
+    return "envy", ""
+
+
+# ----------------------------------------------------------------------- sensors
+
+def cpu_temperature():
+    for hw in (SYS / "class/hwmon").glob("hwmon*"):
+        if read(hw / "name") in ("coretemp", "k10temp"):
+            value = read_int(hw / "temp1_input")
+            if value is not None:
+                return value / 1000
+    return None
+
+
+def fan_speeds():
+    speeds = []
+    for node in sorted((SYS / "class/hwmon").glob("hwmon*/fan*_input")):
+        value = read_int(node)
+        if value is not None:
+            speeds.append(value)
+    return speeds
+
+
+class FanWatcher:
+    """Fan RPM through the root helper (acpi_call). One helper process serves the whole session."""
+
+    def __init__(self):
+        self.process = None
+        self.latest, self.stamp = [], 0.0
+
+    def speeds(self):
+        if self.process is None:
+            if not os.path.exists(HELPER):
+                return []
+            try:
+                self.process = subprocess.Popen(
+                    ["pkexec", HELPER, "watch", "fans"], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            except OSError:
+                return []
+            threading.Thread(target=self._listen, daemon=True).start()
+        # An old reading is worse than none
+        return self.latest if time.monotonic() - self.stamp < 7 else []
+
+    def _listen(self):
+        for line in self.process.stdout:
+            try:
+                values = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(values, list) and all(isinstance(v, int) for v in values):
+                self.latest, self.stamp = values, time.monotonic()
+        self.process.wait()  # never restarted, so a refusal cannot cause repeated prompts
+
+
+class CpuMeter:
+    def __init__(self):
+        self.last = None
+
+    def percent(self):
+        text = read(PROC / "stat")
+        if not text:
+            return None
+        values = [int(v) for v in text.splitlines()[0].split()[1:9]]
+        idle, total = values[3] + values[4], sum(values)
+        previous, self.last = self.last, (idle, total)
+        if not previous or total <= previous[1]:
+            return None
+        busy = 1 - (idle - previous[0]) / (total - previous[1])
+        return max(0.0, min(100.0, busy * 100))
+
+
+def memory_info():
+    values = {}
+    for line in (read(PROC / "meminfo") or "").splitlines():
+        key, _, rest = line.partition(":")
+        if key in ("MemTotal", "MemAvailable"):
+            values[key] = int(rest.split()[0]) / 1_048_576
+    if len(values) != 2:
+        return None
+    return values["MemTotal"] - values["MemAvailable"], values["MemTotal"]
+
+
+def snapshot(meter, watcher=None):
+    return {
+        "cpu_temp": cpu_temperature(), "cpu_use": meter.percent(), "memory": memory_info(),
+        "fans": fan_speeds() or (watcher.speeds() if watcher else []), "battery": battery_info(), "ac": on_ac(), "charge": charge_info(),
+        "profile": profile_info(), "idle": idle_info(),
+        "toggles": toggle_info(), "backlight": backlight_info(), "keyboard": keyboard_info(),
+        "display": display_info(), "nvidia": nvidia_state(),
+    }
+
+
+# ----------------------------------------------------------------------- presets
+
+# key: (title, performance modes to try in order, refresh pick, brightness %, extras)
+PRESETS = {
+    "ultra": ("Ultra saver", ["ultra-saver"], min, 20, {"keyboard": 0, "idle": 5}),
+    "saver": ("Battery saver", ["low-power", "quiet"], min, 40, {}),
+    "daily": ("Daily", ["balanced"], max, 70, {}),
+    "boost": ("Performance", ["performance", "balanced-performance"], max, None, {}),
+}
+
+
+def apply_preset(key):
+    title, wanted, pick_rate, brightness, extras = PRESETS[key]
+    if key == "boost" and on_ac() is False:
+        raise ActionError(f"Plug in the charger to use the {title} preset.")
+    done, failed = [], []
+    steps = []
+    profile = profile_info()
+    if profile:
+        name = next((p for p in wanted if p in profile["options"]), None)
+        if name:
+            steps.append(lambda: set_profile(name))
+    screen = display_info()
+    if screen and screen["options"]:
+        rate = pick_rate(screen["options"])
+        if rate != screen["active"]:
+            steps.append(lambda: set_refresh(rate))
+    if brightness and backlight_info():
+        steps.append(lambda: set_brightness(brightness))
+    if extras.get("keyboard") is not None and keyboard_info():
+        steps.append(lambda: set_keyboard(extras["keyboard"]))
+    if extras.get("idle") in IDLE_PRESETS and idle_info():
+        steps.append(lambda: set_idle(extras["idle"]))
+    for step in steps:
+        try:
+            done.append(step())
+        except ActionError as err:
+            failed.append(str(err))
+    if failed:
+        raise ActionError(f"{title} partly applied. " + " ".join(failed))
+    return f"{title} applied" if done else f"{title}: nothing to change"
+
+
+# --------------------------------------------- settings per power source (auto switch)
+
+AUTO_FILE = CONFIG_DIR / "loq-center" / "auto.json"
+AUTO_SOURCES = {"ac": "On charger", "battery": "On battery"}
+SWITCH_NAME = "Smart Switch"  # the tab that changes settings with the charger
+SWITCH_HINTS = {"ac": "Applied when plugged in", "battery": "Applied when unplugged"}
+AUTO_KEYS = ("profile", "refresh", "idle", "brightness")
+AUTO_TITLES = {"profile": "Performance", "refresh": "Refresh rate", "idle": "Sleep after",
+               "brightness": "Brightness"}
+AUTO_BRIGHTNESS = (20, 30, 40, 50, 60, 70, 80, 90, 100)
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def clean_auto_value(key, value):
+    """A saved value that makes sense, or None, which means 'leave this setting alone'."""
+    if key == "profile":
+        return value if isinstance(value, str) and re.fullmatch(r"[a-z-]{2,30}", value) else None
+    if key == "refresh":
+        return value if _is_int(value) and 24 <= value <= 500 else None
+    if key == "idle":
+        return value if _is_int(value) and value in IDLE_PRESETS else None
+    if key == "brightness":
+        return value if _is_int(value) and 5 <= value <= 100 else None
+    return None
+
+
+def load_auto():
+    config = {"enabled": False, **{s: dict.fromkeys(AUTO_KEYS) for s in AUTO_SOURCES}}
+    try:
+        data = json.loads(AUTO_FILE.read_text())
+    except (OSError, ValueError):
+        return config
+    if not isinstance(data, dict):
+        return config
+    config["enabled"] = data.get("enabled") is True
+    for source in AUTO_SOURCES:
+        saved = data.get(source)
+        if isinstance(saved, dict):
+            for key in AUTO_KEYS:
+                config[source][key] = clean_auto_value(key, saved.get(key))
+    if config["battery"]["profile"] in CHARGER_ONLY:  # saved by an older version
+        config["battery"]["profile"] = "balanced"
+    return config
+
+
+def save_auto(config):
+    try:
+        AUTO_FILE.parent.mkdir(parents=True, exist_ok=True)
+        part = AUTO_FILE.with_suffix(".tmp")
+        part.write_text(json.dumps(config, indent=2))
+        part.replace(AUTO_FILE)
+    except OSError as err:
+        raise ActionError(f"Could not save {AUTO_FILE}: {err}")
+
+
+def auto_choices(key, source, options, saved=None):
+    """The (value, label) pairs one drop-down offers, without "Keep"."""
+    if key == "profile":
+        return [(p, PROFILE_LABELS.get(p, p)) for p in usable_profiles(options["profile"], source)]
+    if key == "refresh":
+        return [(r, f"{r} Hz") for r in options["refresh"]]
+    if key == "idle":
+        return [(k, v[0]) for k, v in IDLE_PRESETS.items()] if options["idle"] else []
+    if not options["brightness"]:
+        return []
+    levels = set(AUTO_BRIGHTNESS) | ({saved} if saved else set())
+    return [(b, f"{b}%") for b in sorted(levels)]
+
+
+def power_source():
+    ac = on_ac()
+    return None if ac is None else ("ac" if ac else "battery")
+
+
+def apply_auto(source, only=None):
+    """Applies the saved settings for "ac" or "battery". Only changes what is different.
+
+    `only` limits this to one setting, so that picking it does not reset the others."""
+    saved = load_auto()[source]
+    entry = {key: saved[key] if only in (None, key) else None for key in AUTO_KEYS}
+    title = AUTO_SOURCES[source]
+    steps = []
+
+    want = entry["profile"]
+    check = only in (None, "profile") and (want or source == "battery")
+    now = profile_info() if check else None
+    if now:
+        # "Keep" must not leave a charger-only mode running after unplugging
+        if not want and source == "battery" and now["active"] in CHARGER_ONLY:
+            want = "balanced"
+        if want in now["options"] and now["active"] != want:
+            steps.append(lambda: set_profile(want))
+    rate = entry["refresh"]
+    if rate:
+        screen = display_info()
+        if screen and rate in screen["options"] and screen["active"] != rate:
+            steps.append(lambda: set_refresh(rate))
+    minutes = entry["idle"]
+    if minutes is not None:
+        idle = idle_info()
+        if idle is not None and idle["active"] != minutes:
+            steps.append(lambda: set_idle(minutes))
+    level = entry["brightness"]
+    light = backlight_info()
+    if level and light and round(light["value"] * 100 / light["max"]) != level:
+        steps.append(lambda: set_brightness(level))
+
+    done, failed = [], []
+    for step in steps:
+        try:
+            done.append(step())
+        except ActionError as err:
+            failed.append(str(err))
+    if failed:
+        raise ActionError(f"{title}: " + " ".join(failed))
+    return f"{title}: settings applied" if done else f"{title}: already set"
+
+
+def daemon_lock_path():
+    return Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "loq-center-auto.lock"
+
+
+def daemon_running():
+    try:
+        with open(daemon_lock_path(), "w") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        return False
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+
+
+def start_daemon():
+    """Starts the background watcher unless it is already running."""
+    if daemon_running():
+        return
+    try:
+        subprocess.Popen([sys.executable, os.path.realpath(sys.argv[0]), "--daemon"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as err:
+        log(f"could not start the {SWITCH_NAME} service: {err}")
+
+
+def _mtime(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0
+
+
+def ensure_session_env():
+    """A process started early may lack the variables hyprctl and hypridle need. Find them.
+
+    Returns True when a Hyprland session was found."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    os.environ["XDG_RUNTIME_DIR"] = runtime
+    base = Path(runtime)
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    if not signature or not (base / "hypr" / signature / ".socket.sock").exists():
+        found = sorted((base / "hypr").glob("*/.socket.sock"), key=_mtime)
+        if found:
+            os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = found[-1].parent.name
+        else:
+            os.environ.pop("HYPRLAND_INSTANCE_SIGNATURE", None)
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        sockets = sorted(p.name for p in base.glob("wayland-[0-9]") if p.is_socket())
+        if sockets:
+            os.environ["WAYLAND_DISPLAY"] = sockets[0]
+    return bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"))
+
+
+def run_daemon(stop=lambda: False, interval=3.0, wait=90.0):
+    """Applies the saved settings whenever the charger is plugged in or unplugged."""
+    last, pending = None, None
+    started = time.monotonic()
+    while not stop():
+        ready = ensure_session_env() or not have("hyprctl")
+        source = power_source()
+        if source is not None and source != last:
+            last, pending = source, source
+        if pending:
+            if not load_auto()["enabled"]:
+                pending = None
+            elif ready or time.monotonic() - started > wait:
+                try:
+                    print(apply_auto(pending), flush=True)
+                except ActionError as err:
+                    print(f"{SWITCH_NAME}: {err}", file=sys.stderr, flush=True)
+                pending = None
+        time.sleep(interval)
+    return 0
+
+
+def daemon_main():
+    try:
+        handle = open(daemon_lock_path(), "w")
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("The background service is already running.")
+        return 0
+    except OSError as err:
+        print(f"Cannot start the background service: {err}", file=sys.stderr)
+        return 1
+    try:
+        return run_daemon()
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        handle.close()
+
+
+# ------------------------------------------------------------------------ theme
+
+BASE_COLORS = {
+    "loq_bg": "#1e1e2e", "loq_surface": "#2a2b3d", "loq_border": "#45475a",
+    "loq_fg": "#f5e9e4", "loq_muted": "#b4b7d1", "loq_accent": "#c79bf0", "loq_accent2": "#ebbcba",
+    "loq_on_accent": "#1e1e2e",
+}
+
+RULES = """
+window.loq { background-color: @loq_bg; color: @loq_fg; }
+window.loq label { color: @loq_fg; text-shadow: none; }
+window.loq label.title { font-size: 26px; font-weight: 800;
+  text-shadow: 0 1px 8px alpha(@loq_bg, 0.9); }
+window.loq label.chip, window.loq label.status { background-color: alpha(@loq_bg, 0.62);
+  border: 1px solid alpha(@loq_fg, 0.10); border-radius: 999px; padding: 5px 14px; }
+window.loq label.muted { color: @loq_muted; }
+window.loq label.heading { font-weight: bold; color: @loq_accent2; }
+window.loq label.value { font-size: 26px; font-weight: 800; }
+window.loq label.error { color: #ff8f8f; }
+window.loq scrolledwindow, window.loq viewport, window.loq stack {
+  background: none; border: none; box-shadow: none; }
+window.loq scrolledwindow undershoot, window.loq scrolledwindow overshoot { background: none; }
+window.loq scrollbar { background: transparent; border: none; }
+window.loq .card { background-color: alpha(@loq_surface, 0.60);
+  border: 1px solid alpha(@loq_fg, 0.14); border-radius: 20px; padding: 18px; }
+window.loq button { background-image: none; background-color: alpha(@loq_surface, 0.75);
+  color: @loq_fg; border: 1px solid alpha(@loq_fg, 0.10); border-radius: 12px;
+  padding: 9px 14px; box-shadow: none; text-shadow: none;
+  transition: background-color 150ms ease, border-color 150ms ease; }
+window.loq .card button { background-color: alpha(@loq_bg, 0.58); }
+window.loq button:hover { border-color: @loq_accent; }
+window.loq button:focus { border-color: @loq_accent2; }
+window.loq button.active, window.loq button:checked {
+  background-color: @loq_accent; background-image: linear-gradient(135deg, @loq_accent, @loq_accent2);
+  border-color: transparent; }
+window.loq button.active label, window.loq button:checked label { color: @loq_on_accent;
+  font-weight: bold; }
+window.loq button:disabled { opacity: 0.55; }
+window.loq progressbar trough { background-image: none; background-color: alpha(@loq_bg, 0.65);
+  border: none; border-radius: 999px; min-height: 8px; }
+window.loq progressbar progress { background-image: linear-gradient(to right, @loq_accent, @loq_accent2);
+  border: none; border-radius: 999px; min-height: 8px; }
+window.loq scale trough { background-color: alpha(@loq_bg, 0.65); border: none;
+  border-radius: 999px; min-height: 8px; }
+window.loq scale highlight { background-image: linear-gradient(to right, @loq_accent, @loq_accent2);
+  border: none; border-radius: 999px; }
+window.loq scale slider { background-image: none; background-color: @loq_fg; border: none;
+  box-shadow: 0 1px 4px alpha(black, 0.4); min-width: 20px; min-height: 20px; }
+window.loq stackswitcher { background-color: alpha(@loq_bg, 0.62);
+  border: 1px solid alpha(@loq_fg, 0.10); border-radius: 17px; box-shadow: none; padding: 5px; }
+window.loq stackswitcher button { background-color: transparent; border: 1px solid transparent;
+  border-radius: 12px; margin: 0; padding: 8px 6px; }
+window.loq stackswitcher button:hover { background-color: alpha(@loq_surface, 0.80); }
+window.loq stackswitcher button:focus { border-color: @loq_accent2; }
+window.loq stackswitcher button:checked {
+  background-image: linear-gradient(135deg, @loq_accent, @loq_accent2); }
+window.loq label.title2 { font-size: 17px; font-weight: 800; }
+window.loq label.caption { font-size: 11px; font-weight: bold; color: @loq_muted; }
+window.loq label.badge { background-color: @loq_accent; color: @loq_on_accent;
+  border-radius: 999px; padding: 3px 11px; font-size: 11px; font-weight: 800; }
+window.loq .card.hero { background-image: linear-gradient(135deg, alpha(@loq_accent, 0.24),
+  alpha(@loq_surface, 0.55)); border-color: alpha(@loq_accent, 0.35); border-radius: 24px;
+  padding: 22px 24px; }
+window.loq .card.source { border-radius: 24px; padding: 22px;
+  transition: opacity 200ms ease, border-color 200ms ease, box-shadow 200ms ease; }
+window.loq .card.source.now { border-color: alpha(@loq_accent, 0.80);
+  background-color: alpha(@loq_surface, 0.80);
+  box-shadow: 0 0 0 1px alpha(@loq_accent, 0.35), 0 10px 28px alpha(@loq_accent, 0.20); }
+window.loq .card.source.dim { opacity: 0.62; }
+window.loq combobox button { background-color: alpha(@loq_bg, 0.65); border-radius: 14px;
+  padding: 10px 14px; min-height: 22px; }
+window.loq combobox button:checked { background-image: none;
+  background-color: alpha(@loq_bg, 0.85); border-color: @loq_accent; }
+window.loq combobox arrow { color: @loq_muted; min-width: 14px; min-height: 14px; }
+window.loq switch { min-width: 52px; min-height: 28px; padding: 0; margin: 0;
+  background-image: none; background-color: alpha(@loq_bg, 0.80);
+  border: none; border-radius: 999px;
+  box-shadow: inset 0 0 0 1px alpha(@loq_fg, 0.20); color: transparent; text-shadow: none;
+  transition: background-color 220ms ease, box-shadow 220ms ease; }
+window.loq switch:hover { box-shadow: inset 0 0 0 1px alpha(@loq_accent, 0.85); }
+window.loq switch:focus { box-shadow: inset 0 0 0 2px alpha(@loq_accent2, 0.90); }
+window.loq switch:checked { background-image: none; background-color: @loq_accent;
+  box-shadow: inset 0 0 0 1px alpha(@loq_accent, 0.60); color: transparent; }
+window.loq switch:checked:hover { box-shadow: 0 0 10px alpha(@loq_accent, 0.55); }
+window.loq switch:checked:focus { box-shadow: 0 0 0 2px alpha(@loq_accent2, 0.90); }
+window.loq switch:disabled { opacity: 0.55; }
+window.loq switch slider { min-width: 22px; min-height: 22px; margin: 3px; padding: 0;
+  background-image: none; background-color: @loq_muted; border: none; border-radius: 999px;
+  box-shadow: 0 1px 3px alpha(black, 0.45);
+  transition: background-color 220ms ease, box-shadow 220ms ease; }
+window.loq switch:hover slider { background-color: @loq_fg; }
+window.loq switch:checked slider { background-color: @loq_on_accent;
+  box-shadow: 0 1px 4px alpha(black, 0.35); }
+window.loq switch:checked:hover slider { background-color: @loq_bg; }
+menu { background-image: none; background-color: @loq_surface; border: 1px solid @loq_border;
+  padding: 4px; }
+menu menuitem { color: @loq_fg; padding: 6px 12px; }
+menu menuitem:hover { background-color: @loq_accent; color: @loq_on_accent; }
+"""
+
+
+def theme_colors(theme_text):
+    """Defaults, overridden only by well-formed colour lines from the wallbash theme."""
+    colors = dict(BASE_COLORS)
+    for name, value in re.findall(r"@define-color\s+(loq_\w+)\s+(#[0-9A-Fa-f]{6})\s*;", theme_text or ""):
+        if name in colors:
+            colors[name] = value
+    return colors
+
+
+def build_css(theme_text, picture=None, scenes=None):
+    colors = theme_colors(theme_text)
+    css = "".join(f"@define-color {k} {v};\n" for k, v in colors.items()) + RULES
+    if picture:  # the picture, dimmed towards the bottom so that text stays readable
+        css += ("window.loq { background-image: linear-gradient(to bottom, alpha(@loq_bg, 0.15), "
+                f'alpha(@loq_bg, 0.55)), url("{picture.as_uri()}"); background-size: cover; '
+                "background-position: center; background-repeat: no-repeat; }\n")
+    for name, image in (scenes or {}).items():  # one wallpaper per tab, chosen by a window class
+        css += (f"window.loq.scene-{name} {{ background-image: linear-gradient(to bottom, "
+                f'alpha(@loq_bg, 0.30), alpha(@loq_bg, 0.62)), url("{image.as_uri()}"); '
+                "background-size: cover; background-position: center bottom; "
+                "background-repeat: no-repeat; }\n")
+    return css
+
+
+# ------------------------------------------------ built-in wallpapers (generated)
+# Made by tools/build.py from assets/wallpapers/*.svg. Edit the .svg files, not this.
+SCENE_SVG = {
+    'auto': '<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" preserveAspectRatio="xMidYMid slice">\n<title>Dunes at dusk</title>\n<defs>\n<linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1a1038"/><stop offset="0.5" stop-color="#6c3a78"/><stop offset="0.85" stop-color="#e98a79"/><stop offset="1" stop-color="#ffc58a"/></linearGradient>\n<radialGradient id="moon" cx=".5" cy=".5" r=".5"><stop offset="0" stop-color="#fff6e0"/><stop offset=".3" stop-color="#ffe7c2" stop-opacity=".55"/><stop offset="1" stop-color="#ffe7c2" stop-opacity="0"/></radialGradient>\n</defs>\n<rect width="1600" height="900" fill="url(#sky)"/>\n<g><circle cx="381" cy="196" r="1" fill="#fff" opacity="0.85"/><circle cx="758" cy="209" r="1.6" fill="#fff" opacity="0.26"/><circle cx="1340" cy="93" r="0.8" fill="#fff" opacity="0.37"/><circle cx="1147" cy="195" r="1.6" fill="#fff" opacity="0.56"/><circle cx="1023" cy="54" r="0.8" fill="#fff" opacity="0.81"/><circle cx="837" cy="267" r="0.6" fill="#fff" opacity="0.35"/><circle cx="1532" cy="15" r="0.6" fill="#fff" opacity="0.79"/><circle cx="431" cy="214" r="1.2" fill="#fff" opacity="0.71"/><circle cx="1474" cy="142" r="1.6" fill="#fff" opacity="0.54"/><circle cx="1497" cy="316" r="0.6" fill="#fff" opacity="0.27"/><circle cx="792" cy="93" r="1.2" fill="#fff" opacity="0.76"/><circle cx="1368" cy="152" r="1.2" fill="#fff" opacity="0.62"/><circle cx="855" cy="147" r="0.8" fill="#fff" opacity="0.84"/><circle cx="1091" cy="334" r="1" fill="#fff" opacity="0.89"/><circle cx="1074" cy="59" r="1" fill="#fff" opacity="0.88"/><circle cx="1448" cy="205" r="0.8" fill="#fff" opacity="0.66"/><circle cx="1581" cy="96" r="0.6" fill="#fff" opacity="0.29"/><circle cx="1366" cy="356" r="0.6" fill="#fff" opacity="0.47"/><circle cx="107" cy="323" r="0.6" fill="#fff" opacity="0.44"/><circle cx="1230" cy="314" r="0.6" fill="#fff" opacity="0.64"/><circle cx="1219" cy="136" r="1.6" fill="#fff" opacity="0.47"/><circle cx="1409" cy="353" r="1.6" fill="#fff" opacity="0.40"/><circle cx="58" cy="3" r="0.6" fill="#fff" opacity="0.64"/><circle cx="50" cy="71" r="1.2" fill="#fff" opacity="0.44"/><circle cx="421" cy="248" r="1" fill="#fff" opacity="0.45"/><circle cx="1534" cy="323" r="1.2" fill="#fff" opacity="0.49"/><circle cx="1392" cy="139" r="1.6" fill="#fff" opacity="0.69"/><circle cx="164" cy="350" r="1.6" fill="#fff" opacity="0.43"/><circle cx="1015" cy="258" r="1" fill="#fff" opacity="0.53"/><circle cx="413" cy="109" r="1" fill="#fff" opacity="0.26"/><circle cx="664" cy="209" r="0.6" fill="#fff" opacity="0.49"/><circle cx="943" cy="48" r="1" fill="#fff" opacity="0.55"/><circle cx="1087" cy="127" r="1" fill="#fff" opacity="0.73"/><circle cx="35" cy="22" r="0.6" fill="#fff" opacity="0.88"/><circle cx="402" cy="164" r="1.6" fill="#fff" opacity="0.64"/><circle cx="284" cy="67" r="1" fill="#fff" opacity="0.80"/><circle cx="423" cy="283" r="0.6" fill="#fff" opacity="0.75"/><circle cx="43" cy="205" r="0.8" fill="#fff" opacity="0.45"/><circle cx="356" cy="289" r="0.8" fill="#fff" opacity="0.46"/><circle cx="1085" cy="234" r="0.6" fill="#fff" opacity="0.32"/><circle cx="515" cy="120" r="0.8" fill="#fff" opacity="0.53"/><circle cx="1369" cy="61" r="1" fill="#fff" opacity="0.73"/><circle cx="349" cy="205" r="1" fill="#fff" opacity="0.40"/><circle cx="193" cy="191" r="0.8" fill="#fff" opacity="0.45"/><circle cx="1338" cy="207" r="1" fill="#fff" opacity="0.47"/><circle cx="1325" cy="31" r="1.6" fill="#fff" opacity="0.47"/><circle cx="208" cy="105" r="1" fill="#fff" opacity="0.55"/><circle cx="1015" cy="105" r="1.6" fill="#fff" opacity="0.52"/><circle cx="1473" cy="56" r="0.6" fill="#fff" opacity="0.56"/><circle cx="1332" cy="224" r="1.6" fill="#fff" opacity="0.53"/><circle cx="1520" cy="334" r="0.8" fill="#fff" opacity="0.27"/><circle cx="731" cy="271" r="1.6" fill="#fff" opacity="0.88"/><circle cx="870" cy="320" r="0.6" fill="#fff" opacity="0.81"/><circle cx="1554" cy="43" r="0.8" fill="#fff" opacity="0.28"/><circle cx="1446" cy="250" r="0.8" fill="#fff" opacity="0.83"/><circle cx="1439" cy="208" r="0.6" fill="#fff" opacity="0.56"/><circle cx="193" cy="181" r="0.8" fill="#fff" opacity="0.68"/><circle cx="840" cy="149" r="1.6" fill="#fff" opacity="0.32"/><circle cx="201" cy="350" r="1.6" fill="#fff" opacity="0.56"/><circle cx="1252" cy="127" r="0.8" fill="#fff" opacity="0.33"/><circle cx="1420" cy="43" r="0.8" fill="#fff" opacity="0.76"/><circle cx="1475" cy="290" r="0.6" fill="#fff" opacity="0.57"/><circle cx="913" cy="144" r="1" fill="#fff" opacity="0.41"/><circle cx="989" cy="187" r="0.6" fill="#fff" opacity="0.56"/><circle cx="1242" cy="1" r="0.6" fill="#fff" opacity="0.75"/><circle cx="74" cy="18" r="1.2" fill="#fff" opacity="0.88"/><circle cx="1367" cy="31" r="1.6" fill="#fff" opacity="0.57"/><circle cx="251" cy="26" r="1.2" fill="#fff" opacity="0.67"/><circle cx="939" cy="130" r="0.8" fill="#fff" opacity="0.89"/><circle cx="686" cy="46" r="0.6" fill="#fff" opacity="0.72"/><circle cx="608" cy="29" r="0.8" fill="#fff" opacity="0.28"/><circle cx="737" cy="234" r="1.6" fill="#fff" opacity="0.50"/><circle cx="1282" cy="224" r="1.2" fill="#fff" opacity="0.28"/><circle cx="1004" cy="274" r="1" fill="#fff" opacity="0.52"/><circle cx="1111" cy="166" r="0.8" fill="#fff" opacity="0.39"/><circle cx="432" cy="212" r="1.2" fill="#fff" opacity="0.40"/><circle cx="209" cy="10" r="1" fill="#fff" opacity="0.49"/><circle cx="1437" cy="285" r="1" fill="#fff" opacity="0.33"/><circle cx="1105" cy="338" r="1.6" fill="#fff" opacity="0.77"/><circle cx="1068" cy="264" r="1.6" fill="#fff" opacity="0.60"/><circle cx="1299" cy="258" r="1.2" fill="#fff" opacity="0.34"/><circle cx="1239" cy="16" r="0.6" fill="#fff" opacity="0.62"/><circle cx="1055" cy="135" r="0.6" fill="#fff" opacity="0.47"/><circle cx="1364" cy="9" r="0.6" fill="#fff" opacity="0.69"/><circle cx="1338" cy="343" r="1.6" fill="#fff" opacity="0.44"/><circle cx="142" cy="359" r="1.6" fill="#fff" opacity="0.58"/><circle cx="1144" cy="38" r="0.6" fill="#fff" opacity="0.86"/><circle cx="98" cy="117" r="1.6" fill="#fff" opacity="0.37"/><circle cx="124" cy="359" r="0.8" fill="#fff" opacity="0.55"/><circle cx="1120" cy="339" r="1" fill="#fff" opacity="0.49"/></g>\n<circle cx="330" cy="230" r="170" fill="url(#moon)"/><circle cx="330" cy="230" r="58" fill="#fff4dc"/><circle cx="312" cy="216" r="9" fill="#ead9bd" opacity=".6"/><circle cx="348" cy="246" r="13" fill="#ead9bd" opacity=".5"/>\n<path d="M-50,560 C250,470 520,520 800,560 C1100,600 1350,500 1650,540 L1650,900 L-50,900 Z" fill="#c2607a"/>\n<path d="M-50,650 C200,560 480,640 760,650 C1080,665 1300,580 1650,640 L1650,900 L-50,900 Z" fill="#8d4377"/>\n<path d="M-50,740 C260,650 560,760 860,740 C1160,720 1380,660 1650,730 L1650,900 L-50,900 Z" fill="#5d2d62"/>\n<path d="M-50,830 C300,770 600,850 900,830 C1200,810 1400,780 1650,820 L1650,900 L-50,900 Z" fill="#341a49"/>\n<path d="M-50,740 C260,650 560,760 860,740 C1160,720 1380,660 1650,730" fill="none" stroke="#ffb88a" stroke-width="2" opacity=".35"/>\n<path d="M-50,650 C200,560 480,640 760,650 C1080,665 1300,580 1650,640" fill="none" stroke="#ffc9a0" stroke-width="2" opacity=".4"/>\n</svg>\n',
+    'dashboard': '<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" preserveAspectRatio="xMidYMid slice">\n<title>Mountains at dawn</title>\n<defs>\n<linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#171338"/><stop offset="0.45" stop-color="#4c3482"/><stop offset="0.75" stop-color="#d4668f"/><stop offset="1" stop-color="#ffb88c"/></linearGradient>\n<radialGradient id="sun" cx=".5" cy=".5" r=".5"><stop offset="0" stop-color="#fff3d6"/><stop offset=".25" stop-color="#ffd29a" stop-opacity=".9"/><stop offset="1" stop-color="#ff9a8a" stop-opacity="0"/></radialGradient>\n<linearGradient id="mist" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffc4a0" stop-opacity="0"/><stop offset="0.55" stop-color="#ffc4a0" stop-opacity="0.3"/><stop offset="1" stop-color="#ffc4a0" stop-opacity="0"/></linearGradient>\n</defs>\n<rect width="1600" height="900" fill="url(#sky)"/>\n<g><circle cx="215" cy="322" r="0.6" fill="#fff" opacity="0.42"/><circle cx="793" cy="171" r="1.2" fill="#fff" opacity="0.76"/><circle cx="150" cy="11" r="1.2" fill="#fff" opacity="0.53"/><circle cx="1220" cy="1" r="1.2" fill="#fff" opacity="0.42"/><circle cx="1283" cy="225" r="0.6" fill="#fff" opacity="0.84"/><circle cx="49" cy="10" r="1.6" fill="#fff" opacity="0.26"/><circle cx="1410" cy="261" r="1.2" fill="#fff" opacity="0.72"/><circle cx="844" cy="290" r="1.2" fill="#fff" opacity="0.61"/><circle cx="553" cy="257" r="1.2" fill="#fff" opacity="0.87"/><circle cx="1482" cy="158" r="1.6" fill="#fff" opacity="0.85"/><circle cx="160" cy="239" r="1" fill="#fff" opacity="0.33"/><circle cx="532" cy="274" r="1.6" fill="#fff" opacity="0.86"/><circle cx="675" cy="315" r="0.8" fill="#fff" opacity="0.45"/><circle cx="940" cy="335" r="1.6" fill="#fff" opacity="0.51"/><circle cx="1365" cy="182" r="1.2" fill="#fff" opacity="0.52"/><circle cx="277" cy="209" r="1" fill="#fff" opacity="0.31"/><circle cx="1062" cy="41" r="0.8" fill="#fff" opacity="0.59"/><circle cx="629" cy="186" r="0.6" fill="#fff" opacity="0.56"/><circle cx="494" cy="322" r="1.6" fill="#fff" opacity="0.64"/><circle cx="630" cy="65" r="1.6" fill="#fff" opacity="0.40"/><circle cx="20" cy="76" r="1.6" fill="#fff" opacity="0.40"/><circle cx="822" cy="362" r="1.6" fill="#fff" opacity="0.48"/><circle cx="1456" cy="251" r="1.6" fill="#fff" opacity="0.87"/><circle cx="9" cy="298" r="1.6" fill="#fff" opacity="0.78"/><circle cx="830" cy="213" r="1.2" fill="#fff" opacity="0.87"/><circle cx="770" cy="139" r="1.6" fill="#fff" opacity="0.38"/><circle cx="808" cy="184" r="1" fill="#fff" opacity="0.52"/><circle cx="3" cy="205" r="1.6" fill="#fff" opacity="0.47"/><circle cx="960" cy="306" r="0.8" fill="#fff" opacity="0.61"/><circle cx="289" cy="35" r="1.6" fill="#fff" opacity="0.77"/><circle cx="1306" cy="97" r="0.6" fill="#fff" opacity="0.30"/><circle cx="27" cy="6" r="1" fill="#fff" opacity="0.41"/><circle cx="175" cy="237" r="1" fill="#fff" opacity="0.44"/><circle cx="268" cy="97" r="0.8" fill="#fff" opacity="0.68"/><circle cx="1037" cy="112" r="1" fill="#fff" opacity="0.57"/><circle cx="183" cy="119" r="1" fill="#fff" opacity="0.52"/><circle cx="301" cy="41" r="1.6" fill="#fff" opacity="0.88"/><circle cx="1545" cy="164" r="0.6" fill="#fff" opacity="0.40"/><circle cx="636" cy="13" r="0.8" fill="#fff" opacity="0.54"/><circle cx="810" cy="162" r="0.8" fill="#fff" opacity="0.89"/><circle cx="1009" cy="264" r="1.2" fill="#fff" opacity="0.40"/><circle cx="1038" cy="150" r="1.6" fill="#fff" opacity="0.77"/><circle cx="1056" cy="162" r="1" fill="#fff" opacity="0.33"/><circle cx="339" cy="18" r="0.6" fill="#fff" opacity="0.81"/><circle cx="497" cy="357" r="0.8" fill="#fff" opacity="0.52"/><circle cx="404" cy="3" r="0.6" fill="#fff" opacity="0.63"/><circle cx="348" cy="342" r="1.2" fill="#fff" opacity="0.36"/><circle cx="1388" cy="370" r="1.6" fill="#fff" opacity="0.58"/><circle cx="605" cy="132" r="0.8" fill="#fff" opacity="0.62"/><circle cx="1435" cy="225" r="1.2" fill="#fff" opacity="0.32"/><circle cx="1066" cy="113" r="1.2" fill="#fff" opacity="0.26"/><circle cx="979" cy="153" r="1" fill="#fff" opacity="0.26"/><circle cx="321" cy="125" r="1.6" fill="#fff" opacity="0.76"/><circle cx="543" cy="81" r="0.6" fill="#fff" opacity="0.79"/><circle cx="1491" cy="131" r="1.6" fill="#fff" opacity="0.56"/><circle cx="1577" cy="89" r="0.6" fill="#fff" opacity="0.31"/><circle cx="272" cy="346" r="0.8" fill="#fff" opacity="0.42"/><circle cx="532" cy="192" r="1" fill="#fff" opacity="0.49"/><circle cx="544" cy="111" r="1.6" fill="#fff" opacity="0.76"/><circle cx="1144" cy="186" r="1.6" fill="#fff" opacity="0.61"/><circle cx="167" cy="15" r="0.6" fill="#fff" opacity="0.50"/><circle cx="1586" cy="56" r="0.8" fill="#fff" opacity="0.47"/><circle cx="984" cy="297" r="1.2" fill="#fff" opacity="0.30"/><circle cx="880" cy="215" r="1" fill="#fff" opacity="0.49"/><circle cx="473" cy="203" r="0.6" fill="#fff" opacity="0.55"/><circle cx="443" cy="299" r="1" fill="#fff" opacity="0.26"/><circle cx="1073" cy="35" r="0.6" fill="#fff" opacity="0.79"/><circle cx="1264" cy="71" r="1.6" fill="#fff" opacity="0.52"/><circle cx="185" cy="64" r="0.8" fill="#fff" opacity="0.35"/><circle cx="1352" cy="165" r="1.2" fill="#fff" opacity="0.77"/><circle cx="869" cy="311" r="1.6" fill="#fff" opacity="0.41"/><circle cx="763" cy="38" r="1" fill="#fff" opacity="0.28"/><circle cx="17" cy="373" r="1" fill="#fff" opacity="0.72"/><circle cx="512" cy="149" r="1.2" fill="#fff" opacity="0.29"/><circle cx="1461" cy="369" r="1.2" fill="#fff" opacity="0.32"/><circle cx="344" cy="235" r="1.6" fill="#fff" opacity="0.81"/><circle cx="750" cy="135" r="0.8" fill="#fff" opacity="0.60"/><circle cx="492" cy="94" r="0.6" fill="#fff" opacity="0.78"/><circle cx="143" cy="286" r="0.6" fill="#fff" opacity="0.67"/><circle cx="1030" cy="357" r="1.2" fill="#fff" opacity="0.88"/><circle cx="66" cy="71" r="1.6" fill="#fff" opacity="0.83"/><circle cx="484" cy="127" r="1.6" fill="#fff" opacity="0.65"/><circle cx="1292" cy="35" r="0.8" fill="#fff" opacity="0.26"/><circle cx="390" cy="27" r="1.6" fill="#fff" opacity="0.81"/><circle cx="1167" cy="8" r="0.6" fill="#fff" opacity="0.44"/><circle cx="1267" cy="187" r="0.8" fill="#fff" opacity="0.32"/><circle cx="1244" cy="125" r="1.6" fill="#fff" opacity="0.87"/><circle cx="277" cy="295" r="0.8" fill="#fff" opacity="0.78"/><circle cx="512" cy="41" r="1.6" fill="#fff" opacity="0.79"/><circle cx="963" cy="48" r="0.8" fill="#fff" opacity="0.34"/><circle cx="1457" cy="12" r="1" fill="#fff" opacity="0.78"/><circle cx="998" cy="255" r="1.6" fill="#fff" opacity="0.80"/><circle cx="1194" cy="262" r="0.8" fill="#fff" opacity="0.44"/><circle cx="860" cy="18" r="0.8" fill="#fff" opacity="0.41"/><circle cx="103" cy="366" r="1.2" fill="#fff" opacity="0.61"/><circle cx="866" cy="323" r="1.2" fill="#fff" opacity="0.26"/><circle cx="1338" cy="65" r="1.2" fill="#fff" opacity="0.27"/><circle cx="1034" cy="158" r="1.6" fill="#fff" opacity="0.26"/><circle cx="1107" cy="220" r="1.6" fill="#fff" opacity="0.33"/><circle cx="415" cy="315" r="1.2" fill="#fff" opacity="0.62"/><circle cx="275" cy="34" r="1.2" fill="#fff" opacity="0.25"/><circle cx="846" cy="190" r="1.2" fill="#fff" opacity="0.85"/><circle cx="1023" cy="86" r="1" fill="#fff" opacity="0.57"/><circle cx="766" cy="86" r="1.2" fill="#fff" opacity="0.47"/><circle cx="978" cy="277" r="1" fill="#fff" opacity="0.88"/><circle cx="351" cy="350" r="1.6" fill="#fff" opacity="0.67"/><circle cx="590" cy="194" r="0.8" fill="#fff" opacity="0.45"/><circle cx="1108" cy="323" r="1" fill="#fff" opacity="0.36"/><circle cx="1122" cy="177" r="0.6" fill="#fff" opacity="0.81"/><circle cx="1435" cy="365" r="1.6" fill="#fff" opacity="0.50"/></g>\n<circle cx="1090" cy="520" r="260" fill="url(#sun)"/><circle cx="1090" cy="520" r="46" fill="#fff1d0"/>\n<path d="M-40,491 L-33,499 L-27,501 L-20,506 L-14,523 L-7,520 L-1,524 L6,535 L12,543 L19,543 L26,533 L32,539 L39,542 L45,542 L52,549 L58,552 L65,543 L72,535 L78,535 L85,531 L91,540 L98,540 L104,547 L111,548 L118,552 L124,548 L131,557 L137,556 L144,564 L150,554 L157,547 L163,546 L170,543 L177,544 L183,555 L190,554 L196,557 L203,553 L209,539 L216,545 L222,537 L229,541 L236,542 L242,543 L249,540 L255,532 L262,521 L268,515 L275,519 L282,514 L288,522 L295,519 L301,529 L308,530 L314,520 L321,525 L328,524 L334,532 L341,527 L347,527 L354,540 L360,554 L367,564 L373,566 L380,569 L387,568 L393,561 L400,549 L406,541 L413,544 L419,533 L426,527 L432,533 L439,538 L446,542 L452,541 L459,535 L465,541 L472,537 L478,547 L485,551 L492,550 L498,544 L505,547 L511,542 L518,556 L524,559 L531,559 L538,562 L544,569 L551,571 L557,579 L564,575 L570,574 L577,564 L583,565 L590,569 L597,575 L603,573 L610,569 L616,556 L623,552 L629,546 L636,550 L642,549 L649,552 L656,558 L662,568 L669,576 L675,581 L682,583 L688,575 L695,579 L702,581 L708,579 L715,590 L721,587 L728,594 L734,591 L741,600 L748,603 L754,608 L761,617 L767,636 L774,649 L780,649 L787,647 L793,654 L800,662 L807,670 L813,668 L820,663 L826,670 L833,666 L839,656 L846,648 L852,653 L859,654 L866,652 L872,648 L879,646 L885,647 L892,656 L898,667 L905,673 L912,664 L918,654 L925,648 L931,638 L938,645 L944,641 L951,629 L958,624 L964,621 L971,631 L977,633 L984,640 L990,640 L997,635 L1003,627 L1010,627 L1017,626 L1023,634 L1030,635 L1036,625 L1043,623 L1049,618 L1056,620 L1062,624 L1069,630 L1076,626 L1082,631 L1089,642 L1095,644 L1102,642 L1108,630 L1115,626 L1122,624 L1128,625 L1135,622 L1141,611 L1148,612 L1154,602 L1161,608 L1168,604 L1174,593 L1181,586 L1187,585 L1194,581 L1200,583 L1207,590 L1213,585 L1220,589 L1227,594 L1233,599 L1240,599 L1246,590 L1253,589 L1259,580 L1266,584 L1272,582 L1279,590 L1286,586 L1292,575 L1299,570 L1305,561 L1312,562 L1318,549 L1325,537 L1332,536 L1338,540 L1345,535 L1351,538 L1358,540 L1364,544 L1371,551 L1378,554 L1384,548 L1391,542 L1397,542 L1404,547 L1410,552 L1417,548 L1423,565 L1430,569 L1437,574 L1443,580 L1450,570 L1456,571 L1463,565 L1469,572 L1476,583 L1482,584 L1489,584 L1496,597 L1502,601 L1509,600 L1515,594 L1522,587 L1528,583 L1535,584 L1542,589 L1548,586 L1555,574 L1561,575 L1568,564 L1574,563 L1581,555 L1588,548 L1594,531 L1601,527 L1607,526 L1614,516 L1620,508 L1627,507 L1633,504 L1640,511 L1640,900 L-40,900 Z" fill="#9a6ab0" opacity="0.9"/>\n<rect x="0" y="520" width="1600" height="140" fill="url(#mist)"/>\n<path d="M-40,574 L-33,569 L-27,572 L-20,572 L-14,574 L-7,584 L-1,579 L6,585 L12,589 L19,593 L26,592 L32,593 L39,580 L45,578 L52,560 L58,565 L65,561 L72,551 L78,543 L85,535 L91,523 L98,523 L104,510 L111,517 L118,514 L124,522 L131,526 L137,525 L144,528 L150,519 L157,515 L163,524 L170,525 L177,521 L183,514 L190,506 L196,514 L203,522 L209,523 L216,538 L222,540 L229,542 L236,534 L242,534 L249,521 L255,524 L262,514 L268,522 L275,530 L282,535 L288,531 L295,531 L301,535 L308,520 L314,517 L321,513 L328,514 L334,508 L341,508 L347,518 L354,513 L360,518 L367,517 L373,519 L380,521 L387,530 L393,534 L400,523 L406,523 L413,526 L419,527 L426,533 L432,532 L439,540 L446,552 L452,546 L459,548 L465,545 L472,544 L478,547 L485,556 L492,568 L498,573 L505,564 L511,567 L518,562 L524,570 L531,572 L538,580 L544,575 L551,563 L557,567 L564,563 L570,567 L577,566 L583,568 L590,556 L597,552 L603,551 L610,531 L616,525 L623,520 L629,516 L636,524 L642,533 L649,533 L656,542 L662,556 L669,564 L675,568 L682,577 L688,572 L695,575 L702,578 L708,586 L715,602 L721,604 L728,590 L734,592 L741,591 L748,594 L754,598 L761,610 L767,627 L774,653 L780,650 L787,650 L793,656 L800,672 L807,684 L813,683 L820,685 L826,687 L833,698 L839,701 L846,690 L852,689 L859,689 L866,690 L872,679 L879,664 L885,666 L892,658 L898,650 L905,651 L912,642 L918,635 L925,645 L931,643 L938,647 L944,641 L951,640 L958,647 L964,653 L971,658 L977,660 L984,653 L990,653 L997,657 L1003,653 L1010,643 L1017,639 L1023,630 L1030,628 L1036,610 L1043,595 L1049,579 L1056,573 L1062,562 L1069,553 L1076,548 L1082,544 L1089,533 L1095,531 L1102,534 L1108,536 L1115,537 L1122,535 L1128,539 L1135,533 L1141,534 L1148,530 L1154,538 L1161,541 L1168,554 L1174,553 L1181,550 L1187,533 L1194,523 L1200,516 L1207,524 L1213,519 L1220,504 L1227,506 L1233,515 L1240,536 L1246,542 L1253,551 L1259,556 L1266,566 L1272,579 L1279,595 L1286,599 L1292,606 L1299,600 L1305,592 L1312,591 L1318,586 L1325,594 L1332,599 L1338,599 L1345,595 L1351,581 L1358,579 L1364,575 L1371,576 L1378,568 L1384,567 L1391,569 L1397,567 L1404,561 L1410,568 L1417,583 L1423,587 L1430,594 L1437,589 L1443,587 L1450,590 L1456,596 L1463,585 L1469,577 L1476,579 L1482,570 L1489,559 L1496,559 L1502,555 L1509,561 L1515,558 L1522,563 L1528,568 L1535,557 L1542,560 L1548,563 L1555,555 L1561,560 L1568,561 L1574,551 L1581,563 L1588,562 L1594,576 L1601,580 L1607,576 L1614,577 L1620,590 L1627,595 L1633,602 L1640,616 L1640,900 L-40,900 Z" fill="#6b4a9a" opacity="1"/>\n<rect x="0" y="600" width="1600" height="140" fill="url(#mist)"/>\n<path d="M-40,625 L-33,613 L-27,607 L-20,604 L-14,608 L-7,606 L-1,611 L6,600 L12,598 L19,598 L26,604 L32,590 L39,592 L45,595 L52,601 L58,595 L65,602 L72,598 L78,586 L85,589 L91,588 L98,584 L104,595 L111,606 L118,607 L124,617 L131,637 L137,642 L144,647 L150,656 L157,664 L163,659 L170,660 L177,671 L183,689 L190,695 L196,703 L203,697 L209,703 L216,718 L222,720 L229,724 L236,742 L242,749 L249,745 L255,735 L262,734 L268,728 L275,729 L282,739 L288,752 L295,750 L301,763 L308,757 L314,763 L321,770 L328,781 L334,788 L341,797 L347,799 L354,788 L360,798 L367,792 L373,784 L380,791 L387,795 L393,798 L400,790 L406,794 L413,791 L419,778 L426,774 L432,776 L439,774 L446,758 L452,746 L459,733 L465,725 L472,729 L478,717 L485,720 L492,722 L498,731 L505,740 L511,737 L518,730 L524,734 L531,736 L538,738 L544,735 L551,737 L557,727 L564,723 L570,723 L577,713 L583,708 L590,712 L597,712 L603,704 L610,708 L616,707 L623,715 L629,709 L636,720 L642,729 L649,733 L656,724 L662,715 L669,708 L675,706 L682,700 L688,709 L695,713 L702,722 L708,719 L715,736 L721,740 L728,735 L734,742 L741,748 L748,766 L754,765 L761,763 L767,762 L774,752 L780,755 L787,756 L793,754 L800,758 L807,765 L813,756 L820,751 L826,752 L833,738 L839,738 L846,736 L852,749 L859,735 L866,737 L872,737 L879,729 L885,713 L892,710 L898,708 L905,700 L912,694 L918,677 L925,685 L931,676 L938,671 L944,656 L951,657 L958,661 L964,665 L971,665 L977,659 L984,643 L990,645 L997,640 L1003,644 L1010,656 L1017,663 L1023,661 L1030,662 L1036,676 L1043,675 L1049,680 L1056,697 L1062,697 L1069,694 L1076,692 L1082,684 L1089,683 L1095,684 L1102,675 L1108,682 L1115,690 L1122,677 L1128,679 L1135,666 L1141,669 L1148,663 L1154,666 L1161,665 L1168,670 L1174,676 L1181,667 L1187,653 L1194,647 L1200,647 L1207,636 L1213,649 L1220,651 L1227,651 L1233,654 L1240,668 L1246,666 L1253,677 L1259,680 L1266,686 L1272,693 L1279,692 L1286,699 L1292,688 L1299,679 L1305,692 L1312,691 L1318,697 L1325,701 L1332,700 L1338,708 L1345,710 L1351,717 L1358,719 L1364,722 L1371,716 L1378,719 L1384,724 L1391,726 L1397,727 L1404,743 L1410,738 L1417,723 L1423,720 L1430,728 L1437,716 L1443,718 L1450,714 L1456,707 L1463,706 L1469,712 L1476,710 L1482,695 L1489,698 L1496,700 L1502,697 L1509,693 L1515,690 L1522,676 L1528,670 L1535,672 L1542,685 L1548,690 L1555,697 L1561,698 L1568,699 L1574,702 L1581,703 L1588,688 L1594,677 L1601,681 L1607,689 L1614,686 L1620,691 L1627,707 L1633,720 L1640,723 L1640,900 L-40,900 Z" fill="#3f2f72" opacity="1"/>\n<rect x="0" y="700" width="1600" height="140" fill="url(#mist)"/>\n<path d="M-40,703 L-33,705 L-27,712 L-20,721 L-14,731 L-7,736 L-1,741 L6,737 L12,736 L19,745 L26,748 L32,742 L39,743 L45,736 L52,732 L58,734 L65,738 L72,728 L78,727 L85,726 L91,731 L98,733 L104,743 L111,748 L118,747 L124,744 L131,749 L137,751 L144,748 L150,739 L157,736 L163,742 L170,743 L177,749 L183,750 L190,748 L196,750 L203,758 L209,757 L216,754 L222,747 L229,750 L236,751 L242,749 L249,757 L255,762 L262,769 L268,775 L275,787 L282,788 L288,790 L295,795 L301,791 L308,806 L314,814 L321,811 L328,820 L334,826 L341,828 L347,842 L354,845 L360,844 L367,842 L373,840 L380,847 L387,851 L393,847 L400,852 L406,859 L413,868 L419,866 L426,872 L432,869 L439,871 L446,865 L452,869 L459,862 L465,858 L472,864 L478,873 L485,875 L492,868 L498,865 L505,858 L511,860 L518,851 L524,846 L531,848 L538,849 L544,840 L551,843 L557,843 L564,844 L570,855 L577,860 L583,858 L590,857 L597,858 L603,858 L610,855 L616,856 L623,854 L629,842 L636,836 L642,836 L649,838 L656,836 L662,829 L669,818 L675,806 L682,807 L688,809 L695,800 L702,790 L708,785 L715,788 L721,780 L728,781 L734,773 L741,783 L748,784 L754,790 L761,787 L767,795 L774,805 L780,801 L787,799 L793,801 L800,805 L807,802 L813,789 L820,780 L826,783 L833,782 L839,791 L846,794 L852,785 L859,784 L866,776 L872,779 L879,776 L885,781 L892,774 L898,778 L905,781 L912,781 L918,773 L925,767 L931,761 L938,772 L944,774 L951,767 L958,771 L964,774 L971,778 L977,787 L984,794 L990,802 L997,803 L1003,801 L1010,802 L1017,798 L1023,791 L1030,793 L1036,785 L1043,786 L1049,790 L1056,787 L1062,792 L1069,790 L1076,799 L1082,805 L1089,803 L1095,809 L1102,816 L1108,812 L1115,812 L1122,811 L1128,810 L1135,799 L1141,797 L1148,797 L1154,803 L1161,802 L1168,808 L1174,802 L1181,802 L1187,796 L1194,782 L1200,771 L1207,767 L1213,757 L1220,757 L1227,760 L1233,755 L1240,756 L1246,757 L1253,753 L1259,760 L1266,755 L1272,746 L1279,748 L1286,747 L1292,748 L1299,746 L1305,752 L1312,750 L1318,746 L1325,744 L1332,743 L1338,747 L1345,756 L1351,758 L1358,767 L1364,774 L1371,777 L1378,774 L1384,769 L1391,771 L1397,766 L1404,764 L1410,762 L1417,755 L1423,753 L1430,755 L1437,760 L1443,762 L1450,757 L1456,753 L1463,756 L1469,753 L1476,752 L1482,754 L1489,754 L1496,754 L1502,761 L1509,760 L1515,756 L1522,756 L1528,754 L1535,760 L1542,758 L1548,753 L1555,753 L1561,761 L1568,769 L1574,769 L1581,776 L1588,788 L1594,796 L1601,795 L1607,796 L1614,795 L1620,790 L1627,793 L1633,799 L1640,804 L1640,900 L-40,900 Z" fill="#251d4f" opacity="1"/>\n<rect x="0" y="790" width="1600" height="140" fill="url(#mist)"/>\n<path d="M-40,892 L-33,894 L-27,901 L-20,900 L-14,904 L-7,902 L-1,901 L6,902 L12,899 L19,896 L26,892 L32,893 L39,893 L45,894 L52,890 L58,888 L65,887 L72,888 L78,885 L85,883 L91,886 L98,886 L104,882 L111,874 L118,871 L124,868 L131,864 L137,858 L144,847 L150,847 L157,846 L163,843 L170,839 L177,836 L183,832 L190,832 L196,829 L203,826 L209,825 L216,826 L222,830 L229,832 L236,833 L242,830 L249,827 L255,829 L262,836 L268,836 L275,835 L282,838 L288,840 L295,844 L301,853 L308,855 L314,854 L321,857 L328,856 L334,855 L341,856 L347,859 L354,858 L360,862 L367,860 L373,858 L380,853 L387,852 L393,853 L400,855 L406,861 L413,857 L419,857 L426,858 L432,862 L439,867 L446,865 L452,861 L459,862 L465,867 L472,866 L478,869 L485,869 L492,872 L498,871 L505,869 L511,873 L518,876 L524,878 L531,875 L538,877 L544,883 L551,886 L557,892 L564,894 L570,898 L577,898 L583,899 L590,899 L597,898 L603,893 L610,891 L616,893 L623,890 L629,892 L636,899 L642,900 L649,894 L656,893 L662,894 L669,896 L675,896 L682,898 L688,903 L695,904 L702,901 L708,900 L715,896 L721,892 L728,893 L734,893 L741,894 L748,896 L754,894 L761,893 L767,893 L774,893 L780,894 L787,893 L793,892 L800,891 L807,892 L813,894 L820,895 L826,891 L833,892 L839,887 L846,882 L852,880 L859,884 L866,881 L872,881 L879,887 L885,888 L892,892 L898,894 L905,891 L912,892 L918,896 L925,897 L931,895 L938,902 L944,903 L951,903 L958,902 L964,905 L971,908 L977,904 L984,906 L990,904 L997,903 L1003,906 L1010,910 L1017,910 L1023,906 L1030,902 L1036,899 L1043,900 L1049,898 L1056,898 L1062,899 L1069,901 L1076,901 L1082,905 L1089,905 L1095,901 L1102,901 L1108,901 L1115,896 L1122,894 L1128,893 L1135,894 L1141,896 L1148,899 L1154,896 L1161,899 L1168,901 L1174,903 L1181,905 L1187,899 L1194,898 L1200,897 L1207,899 L1213,903 L1220,903 L1227,904 L1233,906 L1240,904 L1246,900 L1253,903 L1259,903 L1266,904 L1272,903 L1279,899 L1286,898 L1292,899 L1299,896 L1305,891 L1312,886 L1318,881 L1325,879 L1332,882 L1338,880 L1345,882 L1351,878 L1358,878 L1364,883 L1371,886 L1378,883 L1384,885 L1391,884 L1397,884 L1404,888 L1410,884 L1417,879 L1423,882 L1430,879 L1437,873 L1443,871 L1450,872 L1456,870 L1463,869 L1469,872 L1476,867 L1482,866 L1489,869 L1496,866 L1502,867 L1509,861 L1515,859 L1522,856 L1528,859 L1535,858 L1542,855 L1548,854 L1555,848 L1561,843 L1568,844 L1574,843 L1581,844 L1588,842 L1594,839 L1601,834 L1607,832 L1614,831 L1620,827 L1627,822 L1633,814 L1640,806 L1640,900 L-40,900 Z" fill="#150f33" opacity="1"/>\n</svg>\n',
+    'display': '<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" preserveAspectRatio="xMidYMid slice">\n<title>Ocean sunset</title>\n<defs>\n<linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#241446"/><stop offset="0.4" stop-color="#8b3f7c"/><stop offset="0.75" stop-color="#ff7a6e"/><stop offset="1" stop-color="#ffc178"/></linearGradient>\n<linearGradient id="sea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff9a7a"/><stop offset="0.18" stop-color="#9b4a86"/><stop offset="1" stop-color="#150d33"/></linearGradient>\n<radialGradient id="glow" cx=".5" cy=".5" r=".5"><stop offset="0" stop-color="#fff0c4"/><stop offset=".3" stop-color="#ffb26e" stop-opacity=".8"/><stop offset="1" stop-color="#ff7a6e" stop-opacity="0"/></radialGradient>\n</defs>\n<rect width="1600" height="900" fill="url(#sky)"/>\n<g><circle cx="378" cy="24" r="1.2" fill="#fff" opacity="0.56"/><circle cx="144" cy="5" r="1.6" fill="#fff" opacity="0.85"/><circle cx="1281" cy="176" r="0.8" fill="#fff" opacity="0.59"/><circle cx="576" cy="179" r="0.6" fill="#fff" opacity="0.42"/><circle cx="1509" cy="6" r="1" fill="#fff" opacity="0.77"/><circle cx="309" cy="71" r="1" fill="#fff" opacity="0.31"/><circle cx="969" cy="154" r="1.6" fill="#fff" opacity="0.41"/><circle cx="396" cy="64" r="1.6" fill="#fff" opacity="0.80"/><circle cx="12" cy="67" r="1" fill="#fff" opacity="0.80"/><circle cx="813" cy="95" r="1.6" fill="#fff" opacity="0.44"/><circle cx="722" cy="54" r="1" fill="#fff" opacity="0.78"/><circle cx="69" cy="11" r="1" fill="#fff" opacity="0.59"/><circle cx="1037" cy="161" r="0.8" fill="#fff" opacity="0.90"/><circle cx="313" cy="95" r="0.8" fill="#fff" opacity="0.66"/><circle cx="706" cy="42" r="1.2" fill="#fff" opacity="0.74"/><circle cx="513" cy="128" r="1" fill="#fff" opacity="0.32"/><circle cx="99" cy="53" r="1.6" fill="#fff" opacity="0.65"/><circle cx="380" cy="76" r="0.8" fill="#fff" opacity="0.44"/><circle cx="41" cy="82" r="0.6" fill="#fff" opacity="0.83"/><circle cx="1528" cy="169" r="1" fill="#fff" opacity="0.26"/><circle cx="462" cy="222" r="1.2" fill="#fff" opacity="0.81"/><circle cx="1391" cy="156" r="0.6" fill="#fff" opacity="0.44"/><circle cx="306" cy="102" r="0.8" fill="#fff" opacity="0.41"/><circle cx="958" cy="37" r="1.6" fill="#fff" opacity="0.26"/><circle cx="72" cy="39" r="1" fill="#fff" opacity="0.90"/><circle cx="914" cy="101" r="0.8" fill="#fff" opacity="0.53"/><circle cx="333" cy="14" r="0.6" fill="#fff" opacity="0.73"/><circle cx="953" cy="223" r="1.6" fill="#fff" opacity="0.28"/><circle cx="785" cy="57" r="0.6" fill="#fff" opacity="0.33"/><circle cx="847" cy="178" r="1.2" fill="#fff" opacity="0.67"/><circle cx="320" cy="46" r="1.2" fill="#fff" opacity="0.52"/><circle cx="59" cy="97" r="0.8" fill="#fff" opacity="0.67"/><circle cx="685" cy="50" r="0.8" fill="#fff" opacity="0.27"/><circle cx="407" cy="56" r="0.8" fill="#fff" opacity="0.75"/><circle cx="667" cy="60" r="1" fill="#fff" opacity="0.28"/><circle cx="1485" cy="130" r="1.6" fill="#fff" opacity="0.51"/><circle cx="1442" cy="150" r="0.6" fill="#fff" opacity="0.57"/><circle cx="149" cy="49" r="1.6" fill="#fff" opacity="0.83"/><circle cx="1479" cy="77" r="1.2" fill="#fff" opacity="0.77"/><circle cx="1028" cy="187" r="1.6" fill="#fff" opacity="0.39"/><circle cx="1282" cy="184" r="1" fill="#fff" opacity="0.85"/><circle cx="1530" cy="17" r="1" fill="#fff" opacity="0.88"/><circle cx="1069" cy="10" r="1.6" fill="#fff" opacity="0.33"/><circle cx="1550" cy="153" r="0.6" fill="#fff" opacity="0.82"/><circle cx="1101" cy="107" r="1.2" fill="#fff" opacity="0.74"/><circle cx="1484" cy="50" r="0.6" fill="#fff" opacity="0.39"/><circle cx="251" cy="140" r="1" fill="#fff" opacity="0.33"/><circle cx="1296" cy="180" r="0.8" fill="#fff" opacity="0.61"/><circle cx="1406" cy="46" r="1.6" fill="#fff" opacity="0.46"/><circle cx="1427" cy="178" r="1.2" fill="#fff" opacity="0.84"/></g>\n<circle cx="800" cy="520" r="300" fill="url(#glow)"/><circle cx="800" cy="520" r="92" fill="#fff0c8"/>\n<path d="M0,430 C160,400 260,470 420,480 L420,540 L0,540 Z" fill="#3a2260" opacity=".55"/><path d="M1180,520 C1300,470 1420,430 1600,470 L1600,540 L1180,540 Z" fill="#2c1a52" opacity=".6"/>\n<rect x="0" y="520" width="1600" height="380" fill="url(#sea)"/>\n<rect x="675" y="530" width="255" height="2.0" rx="2" fill="#ffd8a0" opacity="0.70"/>\n<rect x="643" y="539" width="275" height="2.4" rx="2" fill="#ffd8a0" opacity="0.67"/>\n<rect x="657" y="553" width="230" height="2.7" rx="2" fill="#ffd8a0" opacity="0.65"/>\n<rect x="663" y="570" width="216" height="3.0" rx="2" fill="#ffd8a0" opacity="0.62"/>\n<rect x="695" y="588" width="211" height="3.4" rx="2" fill="#ffd8a0" opacity="0.60"/>\n<rect x="684" y="609" width="254" height="3.8" rx="2" fill="#ffd8a0" opacity="0.57"/>\n<rect x="689" y="631" width="211" height="4.1" rx="2" fill="#ffd8a0" opacity="0.54"/>\n<rect x="678" y="654" width="222" height="4.4" rx="2" fill="#ffd8a0" opacity="0.52"/>\n<rect x="731" y="679" width="178" height="4.8" rx="2" fill="#ffd8a0" opacity="0.49"/>\n<rect x="675" y="705" width="204" height="5.2" rx="2" fill="#ffd8a0" opacity="0.47"/>\n<rect x="694" y="731" width="164" height="5.5" rx="2" fill="#ffd8a0" opacity="0.44"/>\n<rect x="671" y="759" width="211" height="5.8" rx="2" fill="#ffd8a0" opacity="0.41"/>\n<rect x="736" y="788" width="184" height="6.2" rx="2" fill="#ffd8a0" opacity="0.39"/>\n<rect x="723" y="817" width="141" height="6.5" rx="2" fill="#ffd8a0" opacity="0.36"/>\n<rect x="745" y="847" width="161" height="6.9" rx="2" fill="#ffd8a0" opacity="0.34"/>\n<rect x="717" y="878" width="136" height="7.2" rx="2" fill="#ffd8a0" opacity="0.31"/>\n<rect x="707" y="910" width="133" height="7.6" rx="2" fill="#ffd8a0" opacity="0.28"/>\n<rect x="743" y="942" width="151" height="7.9" rx="2" fill="#ffd8a0" opacity="0.26"/>\n<rect x="707" y="976" width="130" height="8.3" rx="2" fill="#ffd8a0" opacity="0.23"/>\n<rect x="744" y="1009" width="140" height="8.6" rx="2" fill="#ffd8a0" opacity="0.21"/>\n<rect x="725" y="1044" width="129" height="9.0" rx="2" fill="#ffd8a0" opacity="0.18"/>\n<rect x="741" y="1079" width="133" height="9.3" rx="2" fill="#ffd8a0" opacity="0.15"/>\n<rect x="747" y="1114" width="111" height="9.7" rx="2" fill="#ffd8a0" opacity="0.13"/>\n<rect x="756" y="1150" width="83" height="10.0" rx="2" fill="#ffd8a0" opacity="0.10"/>\n<rect x="756" y="1187" width="110" height="10.4" rx="2" fill="#ffd8a0" opacity="0.08"/>\n<rect x="781" y="1224" width="76" height="10.8" rx="2" fill="#ffd8a0" opacity="0.08"/>\n<path d="M0,560 Q200,551 400,560 T800,560 T1200,560 T1600,560" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.22"/>\n<path d="M0,571 Q200,562 400,571 T800,571 T1200,571 T1600,571" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.21"/>\n<path d="M0,591 Q200,582 400,591 T800,591 T1200,591 T1600,591" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.20"/>\n<path d="M0,617 Q200,608 400,617 T800,617 T1200,617 T1600,617" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.19"/>\n<path d="M0,648 Q200,639 400,648 T800,648 T1200,648 T1600,648" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.18"/>\n<path d="M0,683 Q200,674 400,683 T800,683 T1200,683 T1600,683" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.17"/>\n<path d="M0,722 Q200,713 400,722 T800,722 T1200,722 T1600,722" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.16"/>\n<path d="M0,764 Q200,755 400,764 T800,764 T1200,764 T1600,764" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.15"/>\n<path d="M0,809 Q200,800 400,809 T800,809 T1200,809 T1600,809" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.14"/>\n<path d="M0,857 Q200,848 400,857 T800,857 T1200,857 T1600,857" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.13"/>\n<path d="M0,908 Q200,899 400,908 T800,908 T1200,908 T1600,908" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.12"/>\n<path d="M0,961 Q200,952 400,961 T800,961 T1200,961 T1600,961" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.11"/>\n<path d="M0,1017 Q200,1008 400,1017 T800,1017 T1200,1017 T1600,1017" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.10"/>\n<path d="M0,1076 Q200,1067 400,1076 T800,1076 T1200,1076 T1600,1076" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.09"/>\n<path d="M0,1136 Q200,1127 400,1136 T800,1136 T1200,1136 T1600,1136" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.08"/>\n<path d="M0,1199 Q200,1190 400,1199 T800,1199 T1200,1199 T1600,1199" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.07"/>\n<path d="M0,1264 Q200,1255 400,1264 T800,1264 T1200,1264 T1600,1264" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.06"/>\n<path d="M0,1331 Q200,1322 400,1331 T800,1331 T1200,1331 T1600,1331" fill="none" stroke="#ffb7a0" stroke-width="1.3" opacity="0.05"/>\n</svg>\n',
+    'graphics': '<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" preserveAspectRatio="xMidYMid slice">\n<title>Ringed planet</title>\n<defs>\n<radialGradient id="bg" cx=".7" cy=".35" r=".9"><stop offset="0" stop-color="#1c1a52"/><stop offset=".6" stop-color="#0b0a26"/><stop offset="1" stop-color="#05040f"/></radialGradient>\n<radialGradient id="planet" cx=".35" cy=".3" r=".85"><stop offset="0" stop-color="#ffd3a8"/><stop offset=".35" stop-color="#d9779c"/><stop offset=".75" stop-color="#6b3a8e"/><stop offset="1" stop-color="#2a1752"/></radialGradient>\n<radialGradient id="neb1" cx=".5" cy=".5" r=".5"><stop offset="0" stop-color="#7a4bff" stop-opacity=".5"/><stop offset="1" stop-color="#7a4bff" stop-opacity="0"/></radialGradient>\n<radialGradient id="neb2" cx=".5" cy=".5" r=".5"><stop offset="0" stop-color="#2fd0e0" stop-opacity=".35"/><stop offset="1" stop-color="#2fd0e0" stop-opacity="0"/></radialGradient>\n<clipPath id="front"><rect x="0" y="640" width="1600" height="260"/></clipPath><clipPath id="back"><rect x="0" y="0" width="1600" height="640"/></clipPath>\n</defs>\n<rect width="1600" height="900" fill="url(#bg)"/>\n<ellipse cx="420" cy="260" rx="520" ry="300" fill="url(#neb1)"/><ellipse cx="1300" cy="700" rx="560" ry="260" fill="url(#neb2)"/>\n<g><circle cx="997" cy="668" r="1.8" fill="#fff" opacity="0.27"/><circle cx="745" cy="849" r="0.6" fill="#fff" opacity="0.84"/><circle cx="181" cy="422" r="0.8" fill="#fff" opacity="0.50"/><circle cx="163" cy="224" r="0.8" fill="#fff" opacity="0.52"/><circle cx="291" cy="781" r="1.2" fill="#fff" opacity="0.35"/><circle cx="1275" cy="125" r="1.8" fill="#fff" opacity="0.54"/><circle cx="212" cy="875" r="0.6" fill="#fff" opacity="0.39"/><circle cx="345" cy="884" r="0.8" fill="#fff" opacity="0.44"/><circle cx="1538" cy="485" r="0.8" fill="#fff" opacity="0.37"/><circle cx="1550" cy="177" r="1.2" fill="#fff" opacity="0.44"/><circle cx="578" cy="149" r="0.8" fill="#fff" opacity="0.42"/><circle cx="531" cy="736" r="1.8" fill="#fff" opacity="0.25"/><circle cx="1085" cy="304" r="1" fill="#fff" opacity="0.48"/><circle cx="490" cy="627" r="0.8" fill="#fff" opacity="0.56"/><circle cx="1127" cy="51" r="0.6" fill="#fff" opacity="0.87"/><circle cx="572" cy="364" r="1.8" fill="#fff" opacity="0.76"/><circle cx="586" cy="521" r="0.6" fill="#fff" opacity="0.54"/><circle cx="1132" cy="561" r="0.8" fill="#fff" opacity="0.33"/><circle cx="394" cy="738" r="1.2" fill="#fff" opacity="0.47"/><circle cx="568" cy="472" r="1.2" fill="#fff" opacity="0.32"/><circle cx="1197" cy="718" r="1" fill="#fff" opacity="0.27"/><circle cx="1513" cy="82" r="1" fill="#fff" opacity="0.58"/><circle cx="580" cy="133" r="1" fill="#fff" opacity="0.85"/><circle cx="872" cy="281" r="1" fill="#fff" opacity="0.45"/><circle cx="1278" cy="564" r="1" fill="#fff" opacity="0.90"/><circle cx="258" cy="44" r="1.8" fill="#fff" opacity="0.60"/><circle cx="649" cy="214" r="1.8" fill="#fff" opacity="0.47"/><circle cx="400" cy="586" r="0.8" fill="#fff" opacity="0.29"/><circle cx="1466" cy="29" r="1.2" fill="#fff" opacity="0.47"/><circle cx="331" cy="883" r="1.8" fill="#fff" opacity="0.87"/><circle cx="1009" cy="709" r="0.6" fill="#fff" opacity="0.36"/><circle cx="597" cy="53" r="1.2" fill="#fff" opacity="0.44"/><circle cx="725" cy="899" r="0.8" fill="#fff" opacity="0.88"/><circle cx="726" cy="439" r="1" fill="#fff" opacity="0.56"/><circle cx="466" cy="363" r="0.8" fill="#fff" opacity="0.32"/><circle cx="1315" cy="479" r="0.8" fill="#fff" opacity="0.66"/><circle cx="799" cy="305" r="0.6" fill="#fff" opacity="0.57"/><circle cx="824" cy="493" r="1.8" fill="#fff" opacity="0.48"/><circle cx="1258" cy="697" r="1.8" fill="#fff" opacity="0.68"/><circle cx="1215" cy="327" r="1" fill="#fff" opacity="0.79"/><circle cx="424" cy="883" r="1" fill="#fff" opacity="0.87"/><circle cx="544" cy="161" r="0.6" fill="#fff" opacity="0.56"/><circle cx="1238" cy="293" r="1" fill="#fff" opacity="0.55"/><circle cx="1307" cy="583" r="1" fill="#fff" opacity="0.48"/><circle cx="1031" cy="664" r="1.2" fill="#fff" opacity="0.48"/><circle cx="1349" cy="783" r="1.2" fill="#fff" opacity="0.88"/><circle cx="1530" cy="466" r="1.8" fill="#fff" opacity="0.89"/><circle cx="318" cy="326" r="1.2" fill="#fff" opacity="0.43"/><circle cx="126" cy="604" r="1.2" fill="#fff" opacity="0.36"/><circle cx="1249" cy="523" r="1.2" fill="#fff" opacity="0.45"/><circle cx="885" cy="780" r="1" fill="#fff" opacity="0.72"/><circle cx="44" cy="144" r="1.2" fill="#fff" opacity="0.66"/><circle cx="289" cy="683" r="0.8" fill="#fff" opacity="0.66"/><circle cx="67" cy="424" r="0.8" fill="#fff" opacity="0.36"/><circle cx="1427" cy="100" r="0.8" fill="#fff" opacity="0.56"/><circle cx="877" cy="374" r="1" fill="#fff" opacity="0.50"/><circle cx="979" cy="531" r="0.8" fill="#fff" opacity="0.72"/><circle cx="598" cy="315" r="1" fill="#fff" opacity="0.81"/><circle cx="1386" cy="620" r="1.8" fill="#fff" opacity="0.49"/><circle cx="58" cy="552" r="0.6" fill="#fff" opacity="0.44"/><circle cx="820" cy="856" r="1" fill="#fff" opacity="0.87"/><circle cx="1310" cy="377" r="1.8" fill="#fff" opacity="0.67"/><circle cx="591" cy="128" r="1.8" fill="#fff" opacity="0.50"/><circle cx="763" cy="179" r="0.8" fill="#fff" opacity="0.65"/><circle cx="562" cy="804" r="0.6" fill="#fff" opacity="0.50"/><circle cx="522" cy="825" r="1.8" fill="#fff" opacity="0.34"/><circle cx="1007" cy="802" r="1.2" fill="#fff" opacity="0.53"/><circle cx="1563" cy="444" r="1.2" fill="#fff" opacity="0.88"/><circle cx="608" cy="865" r="0.8" fill="#fff" opacity="0.64"/><circle cx="416" cy="883" r="1.2" fill="#fff" opacity="0.41"/><circle cx="31" cy="851" r="1" fill="#fff" opacity="0.57"/><circle cx="458" cy="429" r="0.6" fill="#fff" opacity="0.68"/><circle cx="1537" cy="221" r="0.6" fill="#fff" opacity="0.76"/><circle cx="1323" cy="12" r="1.8" fill="#fff" opacity="0.61"/><circle cx="390" cy="427" r="0.6" fill="#fff" opacity="0.41"/><circle cx="428" cy="139" r="1" fill="#fff" opacity="0.44"/><circle cx="973" cy="427" r="1.8" fill="#fff" opacity="0.82"/><circle cx="1432" cy="15" r="0.8" fill="#fff" opacity="0.45"/><circle cx="854" cy="303" r="1" fill="#fff" opacity="0.73"/><circle cx="43" cy="315" r="1.8" fill="#fff" opacity="0.34"/><circle cx="5" cy="498" r="0.6" fill="#fff" opacity="0.83"/><circle cx="873" cy="13" r="1.2" fill="#fff" opacity="0.64"/><circle cx="1102" cy="858" r="1.2" fill="#fff" opacity="0.81"/><circle cx="1346" cy="428" r="0.8" fill="#fff" opacity="0.83"/><circle cx="744" cy="682" r="1" fill="#fff" opacity="0.79"/><circle cx="1111" cy="390" r="1" fill="#fff" opacity="0.67"/><circle cx="756" cy="280" r="0.8" fill="#fff" opacity="0.56"/><circle cx="879" cy="448" r="1" fill="#fff" opacity="0.60"/><circle cx="681" cy="487" r="0.6" fill="#fff" opacity="0.29"/><circle cx="368" cy="738" r="0.6" fill="#fff" opacity="0.68"/><circle cx="41" cy="650" r="0.6" fill="#fff" opacity="0.90"/><circle cx="1122" cy="44" r="0.6" fill="#fff" opacity="0.39"/><circle cx="1033" cy="857" r="0.8" fill="#fff" opacity="0.90"/><circle cx="1129" cy="394" r="0.8" fill="#fff" opacity="0.65"/><circle cx="662" cy="145" r="1.8" fill="#fff" opacity="0.39"/><circle cx="889" cy="594" r="0.6" fill="#fff" opacity="0.43"/><circle cx="914" cy="107" r="1.2" fill="#fff" opacity="0.82"/><circle cx="215" cy="389" r="1" fill="#fff" opacity="0.70"/><circle cx="783" cy="318" r="1" fill="#fff" opacity="0.84"/><circle cx="221" cy="265" r="1.8" fill="#fff" opacity="0.66"/><circle cx="809" cy="819" r="1.8" fill="#fff" opacity="0.61"/><circle cx="353" cy="57" r="0.8" fill="#fff" opacity="0.42"/><circle cx="1201" cy="465" r="0.8" fill="#fff" opacity="0.78"/><circle cx="1382" cy="408" r="1.2" fill="#fff" opacity="0.37"/><circle cx="1141" cy="590" r="0.6" fill="#fff" opacity="0.62"/><circle cx="58" cy="777" r="1.8" fill="#fff" opacity="0.64"/><circle cx="382" cy="789" r="1.2" fill="#fff" opacity="0.88"/><circle cx="172" cy="478" r="1.8" fill="#fff" opacity="0.72"/><circle cx="86" cy="136" r="1.2" fill="#fff" opacity="0.69"/><circle cx="357" cy="104" r="1.2" fill="#fff" opacity="0.78"/><circle cx="224" cy="562" r="1" fill="#fff" opacity="0.79"/><circle cx="464" cy="837" r="1" fill="#fff" opacity="0.77"/><circle cx="605" cy="650" r="1" fill="#fff" opacity="0.67"/><circle cx="1287" cy="390" r="1" fill="#fff" opacity="0.59"/><circle cx="948" cy="516" r="0.8" fill="#fff" opacity="0.51"/><circle cx="155" cy="30" r="0.8" fill="#fff" opacity="0.38"/><circle cx="784" cy="843" r="1" fill="#fff" opacity="0.25"/><circle cx="752" cy="801" r="1.8" fill="#fff" opacity="0.85"/><circle cx="517" cy="416" r="0.8" fill="#fff" opacity="0.35"/><circle cx="254" cy="337" r="1.2" fill="#fff" opacity="0.81"/><circle cx="751" cy="497" r="0.6" fill="#fff" opacity="0.43"/><circle cx="258" cy="258" r="0.8" fill="#fff" opacity="0.27"/><circle cx="1434" cy="310" r="1" fill="#fff" opacity="0.46"/><circle cx="94" cy="20" r="1.2" fill="#fff" opacity="0.56"/><circle cx="1513" cy="106" r="1" fill="#fff" opacity="0.44"/><circle cx="1079" cy="656" r="0.8" fill="#fff" opacity="0.27"/><circle cx="1144" cy="517" r="0.6" fill="#fff" opacity="0.65"/><circle cx="1459" cy="636" r="1" fill="#fff" opacity="0.37"/><circle cx="578" cy="60" r="1.2" fill="#fff" opacity="0.36"/><circle cx="385" cy="605" r="0.6" fill="#fff" opacity="0.67"/><circle cx="689" cy="878" r="0.6" fill="#fff" opacity="0.55"/><circle cx="725" cy="613" r="0.8" fill="#fff" opacity="0.28"/><circle cx="877" cy="891" r="1.8" fill="#fff" opacity="0.62"/><circle cx="1503" cy="645" r="0.8" fill="#fff" opacity="0.83"/><circle cx="786" cy="842" r="0.6" fill="#fff" opacity="0.69"/><circle cx="1031" cy="448" r="0.6" fill="#fff" opacity="0.28"/><circle cx="1333" cy="401" r="0.6" fill="#fff" opacity="0.82"/><circle cx="1520" cy="175" r="1.8" fill="#fff" opacity="0.67"/><circle cx="301" cy="210" r="1" fill="#fff" opacity="0.76"/><circle cx="139" cy="887" r="0.8" fill="#fff" opacity="0.64"/><circle cx="1371" cy="193" r="0.6" fill="#fff" opacity="0.54"/><circle cx="572" cy="381" r="1.2" fill="#fff" opacity="0.59"/><circle cx="212" cy="11" r="1" fill="#fff" opacity="0.70"/><circle cx="1426" cy="900" r="1.8" fill="#fff" opacity="0.33"/><circle cx="499" cy="79" r="1" fill="#fff" opacity="0.78"/><circle cx="501" cy="117" r="0.6" fill="#fff" opacity="0.56"/><circle cx="1115" cy="719" r="1.8" fill="#fff" opacity="0.68"/><circle cx="441" cy="443" r="0.8" fill="#fff" opacity="0.28"/><circle cx="320" cy="257" r="1" fill="#fff" opacity="0.83"/><circle cx="115" cy="693" r="1.2" fill="#fff" opacity="0.74"/><circle cx="890" cy="806" r="0.8" fill="#fff" opacity="0.62"/><circle cx="707" cy="735" r="0.6" fill="#fff" opacity="0.72"/><circle cx="1122" cy="241" r="1.2" fill="#fff" opacity="0.62"/><circle cx="514" cy="276" r="0.8" fill="#fff" opacity="0.42"/><circle cx="1081" cy="257" r="0.6" fill="#fff" opacity="0.60"/><circle cx="1182" cy="25" r="0.6" fill="#fff" opacity="0.28"/><circle cx="208" cy="321" r="1" fill="#fff" opacity="0.87"/><circle cx="979" cy="208" r="1.2" fill="#fff" opacity="0.33"/><circle cx="322" cy="322" r="0.8" fill="#fff" opacity="0.63"/><circle cx="1323" cy="654" r="0.6" fill="#fff" opacity="0.42"/><circle cx="969" cy="568" r="0.8" fill="#fff" opacity="0.54"/><circle cx="1502" cy="715" r="0.6" fill="#fff" opacity="0.47"/><circle cx="713" cy="205" r="1.8" fill="#fff" opacity="0.53"/><circle cx="706" cy="691" r="0.8" fill="#fff" opacity="0.60"/><circle cx="1551" cy="536" r="0.6" fill="#fff" opacity="0.33"/><circle cx="1361" cy="617" r="0.8" fill="#fff" opacity="0.89"/><circle cx="53" cy="519" r="1.2" fill="#fff" opacity="0.71"/><circle cx="567" cy="418" r="0.8" fill="#fff" opacity="0.43"/><circle cx="322" cy="506" r="1" fill="#fff" opacity="0.75"/><circle cx="1256" cy="330" r="0.8" fill="#fff" opacity="0.78"/><circle cx="1061" cy="818" r="0.6" fill="#fff" opacity="0.65"/><circle cx="641" cy="129" r="0.8" fill="#fff" opacity="0.57"/><circle cx="60" cy="153" r="0.6" fill="#fff" opacity="0.74"/><circle cx="450" cy="829" r="1" fill="#fff" opacity="0.56"/><circle cx="752" cy="480" r="0.6" fill="#fff" opacity="0.77"/><circle cx="602" cy="9" r="1.8" fill="#fff" opacity="0.64"/><circle cx="994" cy="732" r="0.6" fill="#fff" opacity="0.46"/><circle cx="43" cy="281" r="1.2" fill="#fff" opacity="0.58"/><circle cx="873" cy="622" r="1.2" fill="#fff" opacity="0.89"/><circle cx="1305" cy="831" r="1.8" fill="#fff" opacity="0.69"/><circle cx="859" cy="719" r="1" fill="#fff" opacity="0.87"/><circle cx="32" cy="693" r="0.8" fill="#fff" opacity="0.43"/><circle cx="124" cy="79" r="1" fill="#fff" opacity="0.65"/><circle cx="1381" cy="847" r="1.2" fill="#fff" opacity="0.45"/><circle cx="1487" cy="247" r="0.8" fill="#fff" opacity="0.30"/><circle cx="1205" cy="603" r="1" fill="#fff" opacity="0.83"/><circle cx="1100" cy="754" r="1.8" fill="#fff" opacity="0.65"/><circle cx="334" cy="465" r="0.6" fill="#fff" opacity="0.41"/><circle cx="1559" cy="490" r="1.2" fill="#fff" opacity="0.88"/><circle cx="1074" cy="340" r="1.8" fill="#fff" opacity="0.83"/><circle cx="1456" cy="552" r="1.2" fill="#fff" opacity="0.46"/><circle cx="1349" cy="800" r="1" fill="#fff" opacity="0.41"/><circle cx="160" cy="264" r="1" fill="#fff" opacity="0.77"/><circle cx="125" cy="855" r="0.6" fill="#fff" opacity="0.66"/><circle cx="1226" cy="202" r="0.6" fill="#fff" opacity="0.62"/><circle cx="1002" cy="576" r="1.8" fill="#fff" opacity="0.72"/><circle cx="667" cy="383" r="1.8" fill="#fff" opacity="0.64"/><circle cx="391" cy="376" r="0.6" fill="#fff" opacity="0.64"/><circle cx="1547" cy="169" r="0.6" fill="#fff" opacity="0.35"/><circle cx="473" cy="500" r="1.8" fill="#fff" opacity="0.37"/><circle cx="304" cy="535" r="1" fill="#fff" opacity="0.72"/><circle cx="98" cy="436" r="1.8" fill="#fff" opacity="0.87"/><circle cx="510" cy="765" r="1.2" fill="#fff" opacity="0.85"/><circle cx="367" cy="627" r="1.2" fill="#fff" opacity="0.80"/><circle cx="3" cy="605" r="0.6" fill="#fff" opacity="0.31"/><circle cx="243" cy="554" r="0.6" fill="#fff" opacity="0.62"/><circle cx="706" cy="290" r="0.8" fill="#fff" opacity="0.71"/><circle cx="1479" cy="861" r="0.6" fill="#fff" opacity="0.49"/><circle cx="1303" cy="176" r="1" fill="#fff" opacity="0.49"/><circle cx="734" cy="612" r="0.6" fill="#fff" opacity="0.41"/><circle cx="1506" cy="419" r="0.6" fill="#fff" opacity="0.33"/><circle cx="955" cy="337" r="0.6" fill="#fff" opacity="0.57"/><circle cx="1540" cy="851" r="0.6" fill="#fff" opacity="0.57"/><circle cx="1500" cy="641" r="0.6" fill="#fff" opacity="0.33"/><circle cx="766" cy="319" r="0.8" fill="#fff" opacity="0.85"/><circle cx="611" cy="262" r="1.2" fill="#fff" opacity="0.67"/><circle cx="1226" cy="80" r="0.6" fill="#fff" opacity="0.44"/><circle cx="539" cy="763" r="1.8" fill="#fff" opacity="0.53"/><circle cx="353" cy="887" r="1" fill="#fff" opacity="0.68"/><circle cx="117" cy="244" r="0.6" fill="#fff" opacity="0.61"/><circle cx="692" cy="162" r="1.2" fill="#fff" opacity="0.81"/><circle cx="392" cy="407" r="0.8" fill="#fff" opacity="0.78"/><circle cx="8" cy="689" r="1" fill="#fff" opacity="0.78"/><circle cx="34" cy="506" r="1.2" fill="#fff" opacity="0.81"/><circle cx="125" cy="874" r="0.8" fill="#fff" opacity="0.88"/><circle cx="708" cy="425" r="0.6" fill="#fff" opacity="0.87"/><circle cx="957" cy="755" r="1.2" fill="#fff" opacity="0.58"/><circle cx="85" cy="353" r="1.8" fill="#fff" opacity="0.53"/><circle cx="950" cy="812" r="1.8" fill="#fff" opacity="0.66"/><circle cx="58" cy="21" r="1.2" fill="#fff" opacity="0.78"/><circle cx="1318" cy="389" r="1.2" fill="#fff" opacity="0.26"/><circle cx="1305" cy="150" r="1" fill="#fff" opacity="0.35"/><circle cx="1249" cy="380" r="0.6" fill="#fff" opacity="0.90"/><circle cx="347" cy="379" r="1" fill="#fff" opacity="0.34"/><circle cx="581" cy="2" r="0.6" fill="#fff" opacity="0.75"/><circle cx="1213" cy="69" r="1.2" fill="#fff" opacity="0.27"/><circle cx="655" cy="135" r="0.6" fill="#fff" opacity="0.74"/><circle cx="790" cy="286" r="1.2" fill="#fff" opacity="0.34"/><circle cx="378" cy="828" r="1.8" fill="#fff" opacity="0.27"/><circle cx="296" cy="386" r="1" fill="#fff" opacity="0.34"/><circle cx="1046" cy="301" r="0.8" fill="#fff" opacity="0.35"/><circle cx="829" cy="877" r="1.8" fill="#fff" opacity="0.31"/><circle cx="178" cy="579" r="1" fill="#fff" opacity="0.45"/><circle cx="1450" cy="493" r="1.2" fill="#fff" opacity="0.88"/><circle cx="385" cy="512" r="1" fill="#fff" opacity="0.26"/><circle cx="20" cy="347" r="0.8" fill="#fff" opacity="0.56"/><circle cx="1129" cy="7" r="0.8" fill="#fff" opacity="0.52"/><circle cx="807" cy="549" r="1" fill="#fff" opacity="0.29"/><circle cx="801" cy="34" r="1.2" fill="#fff" opacity="0.82"/><circle cx="1242" cy="502" r="1.2" fill="#fff" opacity="0.54"/><circle cx="1048" cy="832" r="1" fill="#fff" opacity="0.62"/><circle cx="441" cy="525" r="1.8" fill="#fff" opacity="0.87"/><circle cx="1581" cy="272" r="0.8" fill="#fff" opacity="0.63"/><circle cx="1092" cy="580" r="0.6" fill="#fff" opacity="0.73"/><circle cx="846" cy="350" r="1.8" fill="#fff" opacity="0.44"/><circle cx="883" cy="747" r="0.8" fill="#fff" opacity="0.55"/><circle cx="101" cy="3" r="1.8" fill="#fff" opacity="0.38"/><circle cx="726" cy="54" r="0.6" fill="#fff" opacity="0.33"/><circle cx="1416" cy="337" r="1" fill="#fff" opacity="0.42"/><circle cx="441" cy="705" r="0.6" fill="#fff" opacity="0.42"/></g>\n<g clip-path="url(#back)"><ellipse cx="1130" cy="640" rx="470" ry="92" fill="none" stroke="#f0c8ff" stroke-width="22" opacity=".55" transform="rotate(-18 1130 640)"/><ellipse cx="1130" cy="640" rx="400" ry="74" fill="none" stroke="#9fd8ff" stroke-width="8" opacity=".4" transform="rotate(-18 1130 640)"/></g>\n<circle cx="1130" cy="640" r="230" fill="url(#planet)"/>\n<path d="M930,600 Q1130,560 1340,610 M910,690 Q1130,650 1350,700 M960,760 Q1130,730 1300,770" fill="none" stroke="#fff" stroke-opacity=".12" stroke-width="14"/>\n<g clip-path="url(#front)"><ellipse cx="1130" cy="640" rx="470" ry="92" fill="none" stroke="#f0c8ff" stroke-width="22" opacity=".55" transform="rotate(-18 1130 640)"/><ellipse cx="1130" cy="640" rx="400" ry="74" fill="none" stroke="#9fd8ff" stroke-width="8" opacity=".4" transform="rotate(-18 1130 640)"/></g>\n<circle cx="300" cy="640" r="70" fill="#3a3560"/><circle cx="318" cy="622" r="70" fill="#14112f" opacity=".55"/><circle cx="272" cy="618" r="10" fill="#2b2650"/><circle cx="330" cy="672" r="14" fill="#2b2650"/>\n</svg>\n',
+    'power': '<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" preserveAspectRatio="xMidYMid slice">\n<title>Aurora over pines</title>\n<defs>\n<linearGradient id="sky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#040916"/><stop offset="0.6" stop-color="#0a2236"/><stop offset="1" stop-color="#10413f"/></linearGradient>\n<linearGradient id="au1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3dffb0" stop-opacity="0"/><stop offset="0.35" stop-color="#3dffb0" stop-opacity="0.75"/><stop offset="0.7" stop-color="#5bd0ff" stop-opacity="0.5"/><stop offset="1" stop-color="#9b6bff" stop-opacity="0"/></linearGradient>\n<linearGradient id="au2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#a06bff" stop-opacity="0"/><stop offset="0.4" stop-color="#7a8bff" stop-opacity="0.55"/><stop offset="1" stop-color="#43ffd0" stop-opacity="0"/></linearGradient>\n<filter id="blur" x="-20%" y="-50%" width="140%" height="200%"><feGaussianBlur stdDeviation="22"/></filter>\n</defs>\n<rect width="1600" height="900" fill="url(#sky)"/>\n<g><circle cx="1530" cy="493" r="0.6" fill="#fff" opacity="0.31"/><circle cx="578" cy="88" r="1" fill="#fff" opacity="0.41"/><circle cx="340" cy="19" r="0.8" fill="#fff" opacity="0.90"/><circle cx="1022" cy="418" r="1.6" fill="#fff" opacity="0.87"/><circle cx="871" cy="231" r="1" fill="#fff" opacity="0.84"/><circle cx="1394" cy="189" r="1" fill="#fff" opacity="0.84"/><circle cx="678" cy="460" r="0.8" fill="#fff" opacity="0.61"/><circle cx="378" cy="12" r="1" fill="#fff" opacity="0.36"/><circle cx="816" cy="187" r="1.6" fill="#fff" opacity="0.69"/><circle cx="291" cy="465" r="1.2" fill="#fff" opacity="0.73"/><circle cx="1451" cy="397" r="1.6" fill="#fff" opacity="0.48"/><circle cx="1570" cy="500" r="0.8" fill="#fff" opacity="0.87"/><circle cx="640" cy="384" r="1.6" fill="#fff" opacity="0.41"/><circle cx="447" cy="259" r="1.6" fill="#fff" opacity="0.79"/><circle cx="566" cy="459" r="1.2" fill="#fff" opacity="0.48"/><circle cx="1161" cy="290" r="1.2" fill="#fff" opacity="0.57"/><circle cx="355" cy="169" r="0.8" fill="#fff" opacity="0.82"/><circle cx="986" cy="402" r="1.2" fill="#fff" opacity="0.45"/><circle cx="1532" cy="367" r="1.6" fill="#fff" opacity="0.62"/><circle cx="812" cy="320" r="1.2" fill="#fff" opacity="0.45"/><circle cx="333" cy="266" r="1.6" fill="#fff" opacity="0.82"/><circle cx="1255" cy="178" r="0.6" fill="#fff" opacity="0.84"/><circle cx="306" cy="387" r="0.6" fill="#fff" opacity="0.62"/><circle cx="78" cy="308" r="0.6" fill="#fff" opacity="0.74"/><circle cx="218" cy="138" r="0.8" fill="#fff" opacity="0.86"/><circle cx="97" cy="467" r="0.6" fill="#fff" opacity="0.29"/><circle cx="576" cy="130" r="0.6" fill="#fff" opacity="0.30"/><circle cx="1527" cy="13" r="0.6" fill="#fff" opacity="0.49"/><circle cx="204" cy="487" r="0.8" fill="#fff" opacity="0.59"/><circle cx="3" cy="307" r="0.8" fill="#fff" opacity="0.35"/><circle cx="58" cy="179" r="1.6" fill="#fff" opacity="0.66"/><circle cx="1196" cy="149" r="1.2" fill="#fff" opacity="0.27"/><circle cx="718" cy="398" r="0.6" fill="#fff" opacity="0.84"/><circle cx="1209" cy="448" r="0.8" fill="#fff" opacity="0.56"/><circle cx="361" cy="344" r="1" fill="#fff" opacity="0.79"/><circle cx="39" cy="410" r="0.8" fill="#fff" opacity="0.59"/><circle cx="1250" cy="253" r="1" fill="#fff" opacity="0.34"/><circle cx="1536" cy="135" r="1.6" fill="#fff" opacity="0.88"/><circle cx="1045" cy="364" r="0.8" fill="#fff" opacity="0.69"/><circle cx="405" cy="68" r="0.8" fill="#fff" opacity="0.31"/><circle cx="1016" cy="264" r="0.6" fill="#fff" opacity="0.90"/><circle cx="372" cy="231" r="1" fill="#fff" opacity="0.30"/><circle cx="365" cy="412" r="1.6" fill="#fff" opacity="0.71"/><circle cx="411" cy="220" r="1.6" fill="#fff" opacity="0.74"/><circle cx="242" cy="200" r="0.8" fill="#fff" opacity="0.32"/><circle cx="1158" cy="125" r="0.6" fill="#fff" opacity="0.26"/><circle cx="1201" cy="55" r="0.6" fill="#fff" opacity="0.59"/><circle cx="743" cy="161" r="1.2" fill="#fff" opacity="0.39"/><circle cx="1451" cy="501" r="1.2" fill="#fff" opacity="0.53"/><circle cx="34" cy="307" r="1.2" fill="#fff" opacity="0.85"/><circle cx="930" cy="479" r="1.2" fill="#fff" opacity="0.49"/><circle cx="831" cy="479" r="1.6" fill="#fff" opacity="0.49"/><circle cx="1105" cy="485" r="1" fill="#fff" opacity="0.26"/><circle cx="1096" cy="53" r="1" fill="#fff" opacity="0.38"/><circle cx="1241" cy="429" r="1.2" fill="#fff" opacity="0.29"/><circle cx="1020" cy="241" r="1.6" fill="#fff" opacity="0.65"/><circle cx="9" cy="13" r="1" fill="#fff" opacity="0.86"/><circle cx="122" cy="393" r="0.8" fill="#fff" opacity="0.33"/><circle cx="597" cy="372" r="0.8" fill="#fff" opacity="0.74"/><circle cx="632" cy="63" r="0.6" fill="#fff" opacity="0.33"/><circle cx="986" cy="174" r="1.2" fill="#fff" opacity="0.87"/><circle cx="1108" cy="13" r="1.2" fill="#fff" opacity="0.76"/><circle cx="1158" cy="259" r="1" fill="#fff" opacity="0.87"/><circle cx="226" cy="195" r="1.2" fill="#fff" opacity="0.59"/><circle cx="764" cy="496" r="1.2" fill="#fff" opacity="0.86"/><circle cx="1338" cy="154" r="0.8" fill="#fff" opacity="0.35"/><circle cx="954" cy="285" r="0.6" fill="#fff" opacity="0.63"/><circle cx="1309" cy="50" r="1" fill="#fff" opacity="0.36"/><circle cx="872" cy="419" r="0.6" fill="#fff" opacity="0.77"/><circle cx="1458" cy="354" r="0.6" fill="#fff" opacity="0.33"/><circle cx="474" cy="120" r="1" fill="#fff" opacity="0.54"/><circle cx="838" cy="58" r="1.6" fill="#fff" opacity="0.89"/><circle cx="1550" cy="220" r="1" fill="#fff" opacity="0.59"/><circle cx="1145" cy="134" r="0.8" fill="#fff" opacity="0.55"/><circle cx="1125" cy="210" r="1" fill="#fff" opacity="0.76"/><circle cx="918" cy="75" r="1.2" fill="#fff" opacity="0.72"/><circle cx="1296" cy="199" r="0.8" fill="#fff" opacity="0.51"/><circle cx="86" cy="142" r="1" fill="#fff" opacity="0.71"/><circle cx="1499" cy="367" r="1.2" fill="#fff" opacity="0.48"/><circle cx="876" cy="371" r="0.6" fill="#fff" opacity="0.75"/><circle cx="1363" cy="117" r="1.6" fill="#fff" opacity="0.37"/><circle cx="1306" cy="199" r="0.6" fill="#fff" opacity="0.45"/><circle cx="838" cy="471" r="1.2" fill="#fff" opacity="0.67"/><circle cx="1306" cy="9" r="0.8" fill="#fff" opacity="0.72"/><circle cx="970" cy="471" r="0.6" fill="#fff" opacity="0.50"/><circle cx="892" cy="417" r="1" fill="#fff" opacity="0.73"/><circle cx="938" cy="100" r="1.6" fill="#fff" opacity="0.34"/><circle cx="980" cy="226" r="1" fill="#fff" opacity="0.58"/><circle cx="278" cy="371" r="0.6" fill="#fff" opacity="0.48"/><circle cx="1449" cy="277" r="0.6" fill="#fff" opacity="0.74"/><circle cx="776" cy="351" r="1" fill="#fff" opacity="0.55"/><circle cx="1404" cy="239" r="0.6" fill="#fff" opacity="0.65"/><circle cx="556" cy="395" r="1.2" fill="#fff" opacity="0.42"/><circle cx="1000" cy="433" r="0.8" fill="#fff" opacity="0.29"/><circle cx="799" cy="516" r="1" fill="#fff" opacity="0.35"/><circle cx="452" cy="243" r="0.6" fill="#fff" opacity="0.49"/><circle cx="861" cy="199" r="1.2" fill="#fff" opacity="0.38"/><circle cx="1082" cy="259" r="0.8" fill="#fff" opacity="0.56"/><circle cx="862" cy="476" r="0.6" fill="#fff" opacity="0.42"/><circle cx="501" cy="174" r="1" fill="#fff" opacity="0.67"/><circle cx="629" cy="437" r="0.6" fill="#fff" opacity="0.58"/><circle cx="337" cy="310" r="0.8" fill="#fff" opacity="0.77"/><circle cx="1006" cy="160" r="0.8" fill="#fff" opacity="0.87"/><circle cx="898" cy="272" r="0.6" fill="#fff" opacity="0.87"/><circle cx="179" cy="426" r="1.2" fill="#fff" opacity="0.81"/><circle cx="342" cy="185" r="1" fill="#fff" opacity="0.55"/><circle cx="266" cy="230" r="1" fill="#fff" opacity="0.55"/><circle cx="214" cy="374" r="0.8" fill="#fff" opacity="0.85"/><circle cx="522" cy="52" r="0.8" fill="#fff" opacity="0.55"/><circle cx="1204" cy="440" r="0.8" fill="#fff" opacity="0.48"/><circle cx="1272" cy="121" r="1.6" fill="#fff" opacity="0.66"/><circle cx="640" cy="428" r="1" fill="#fff" opacity="0.43"/><circle cx="1152" cy="309" r="1.6" fill="#fff" opacity="0.70"/><circle cx="1518" cy="386" r="1" fill="#fff" opacity="0.60"/><circle cx="1019" cy="38" r="1" fill="#fff" opacity="0.51"/><circle cx="280" cy="498" r="1" fill="#fff" opacity="0.54"/><circle cx="140" cy="480" r="1" fill="#fff" opacity="0.87"/><circle cx="203" cy="15" r="1" fill="#fff" opacity="0.36"/><circle cx="123" cy="457" r="1.2" fill="#fff" opacity="0.26"/><circle cx="513" cy="429" r="1.6" fill="#fff" opacity="0.50"/><circle cx="455" cy="332" r="0.8" fill="#fff" opacity="0.48"/><circle cx="323" cy="259" r="0.8" fill="#fff" opacity="0.76"/><circle cx="530" cy="74" r="1" fill="#fff" opacity="0.41"/><circle cx="548" cy="128" r="0.8" fill="#fff" opacity="0.72"/><circle cx="75" cy="489" r="1.6" fill="#fff" opacity="0.29"/><circle cx="230" cy="442" r="1.2" fill="#fff" opacity="0.54"/><circle cx="435" cy="167" r="1.6" fill="#fff" opacity="0.80"/><circle cx="541" cy="399" r="1.6" fill="#fff" opacity="0.87"/><circle cx="364" cy="28" r="1.2" fill="#fff" opacity="0.57"/><circle cx="1394" cy="283" r="1.6" fill="#fff" opacity="0.64"/><circle cx="941" cy="280" r="1.2" fill="#fff" opacity="0.89"/><circle cx="1345" cy="236" r="1.2" fill="#fff" opacity="0.50"/><circle cx="724" cy="457" r="1.2" fill="#fff" opacity="0.90"/><circle cx="205" cy="487" r="1.6" fill="#fff" opacity="0.84"/><circle cx="124" cy="159" r="0.6" fill="#fff" opacity="0.41"/><circle cx="1070" cy="115" r="0.6" fill="#fff" opacity="0.35"/><circle cx="1072" cy="48" r="1.2" fill="#fff" opacity="0.28"/><circle cx="1438" cy="126" r="1.2" fill="#fff" opacity="0.34"/><circle cx="49" cy="362" r="1.6" fill="#fff" opacity="0.29"/><circle cx="319" cy="478" r="1.6" fill="#fff" opacity="0.47"/><circle cx="846" cy="124" r="1" fill="#fff" opacity="0.57"/><circle cx="211" cy="61" r="0.6" fill="#fff" opacity="0.55"/><circle cx="1277" cy="320" r="1.2" fill="#fff" opacity="0.47"/><circle cx="1036" cy="205" r="1.6" fill="#fff" opacity="0.58"/><circle cx="1467" cy="85" r="0.6" fill="#fff" opacity="0.79"/><circle cx="242" cy="498" r="0.8" fill="#fff" opacity="0.50"/><circle cx="476" cy="224" r="1.2" fill="#fff" opacity="0.33"/><circle cx="502" cy="156" r="0.6" fill="#fff" opacity="0.62"/><circle cx="756" cy="148" r="1.2" fill="#fff" opacity="0.89"/><circle cx="367" cy="366" r="1.6" fill="#fff" opacity="0.68"/><circle cx="49" cy="287" r="0.8" fill="#fff" opacity="0.39"/><circle cx="626" cy="20" r="0.8" fill="#fff" opacity="0.66"/><circle cx="1188" cy="365" r="1.2" fill="#fff" opacity="0.60"/><circle cx="1178" cy="448" r="0.8" fill="#fff" opacity="0.79"/><circle cx="957" cy="20" r="0.8" fill="#fff" opacity="0.90"/><circle cx="225" cy="361" r="0.8" fill="#fff" opacity="0.75"/><circle cx="148" cy="357" r="1.2" fill="#fff" opacity="0.66"/><circle cx="1541" cy="82" r="1" fill="#fff" opacity="0.71"/><circle cx="444" cy="469" r="1.6" fill="#fff" opacity="0.29"/><circle cx="1437" cy="347" r="0.6" fill="#fff" opacity="0.55"/><circle cx="1055" cy="63" r="1" fill="#fff" opacity="0.86"/><circle cx="25" cy="218" r="1" fill="#fff" opacity="0.60"/><circle cx="628" cy="273" r="0.8" fill="#fff" opacity="0.53"/><circle cx="206" cy="89" r="1.2" fill="#fff" opacity="0.82"/><circle cx="1553" cy="199" r="1.6" fill="#fff" opacity="0.42"/><circle cx="305" cy="248" r="0.8" fill="#fff" opacity="0.74"/><circle cx="1360" cy="176" r="0.6" fill="#fff" opacity="0.36"/><circle cx="968" cy="447" r="0.8" fill="#fff" opacity="0.75"/><circle cx="1046" cy="300" r="0.8" fill="#fff" opacity="0.69"/><circle cx="493" cy="108" r="1" fill="#fff" opacity="0.31"/></g>\n<g filter="url(#blur)"><path d="M-50,330 C250,120 520,420 820,230 C1100,60 1340,330 1680,150 L1680,420 C1360,560 1100,250 820,440 C520,620 250,330 -50,520 Z" fill="url(#au1)"/><path d="M-50,470 C300,300 600,520 900,360 C1200,200 1400,420 1680,300 L1680,470 C1400,600 1200,420 900,560 C600,700 300,470 -50,640 Z" fill="url(#au2)" opacity=".8"/></g>\n<path d="M-40,683 L-33,682 L-27,682 L-20,682 L-14,681 L-7,679 L-1,680 L6,679 L12,678 L19,681 L26,680 L32,679 L39,680 L45,681 L52,681 L58,684 L65,686 L72,689 L78,690 L85,692 L91,693 L98,694 L104,697 L111,698 L118,700 L124,702 L131,700 L137,700 L144,698 L150,696 L157,697 L163,697 L170,701 L177,697 L183,696 L190,693 L196,694 L203,694 L209,695 L216,695 L222,697 L229,699 L236,698 L242,697 L249,695 L255,691 L262,690 L268,688 L275,686 L282,686 L288,688 L295,688 L301,689 L308,689 L314,691 L321,693 L328,696 L334,694 L341,695 L347,696 L354,698 L360,697 L367,694 L373,695 L380,695 L387,695 L393,697 L400,697 L406,695 L413,698 L419,699 L426,701 L432,700 L439,702 L446,702 L452,702 L459,705 L465,705 L472,705 L478,702 L485,702 L492,704 L498,704 L505,704 L511,705 L518,706 L524,705 L531,702 L538,701 L544,705 L551,708 L557,709 L564,710 L570,709 L577,712 L583,713 L590,714 L597,715 L603,718 L610,718 L616,715 L623,715 L629,716 L636,714 L642,712 L649,713 L656,713 L662,715 L669,714 L675,713 L682,716 L688,715 L695,714 L702,714 L708,715 L715,716 L721,715 L728,716 L734,713 L741,712 L748,712 L754,711 L761,708 L767,708 L774,707 L780,709 L787,711 L793,709 L800,710 L807,708 L813,705 L820,706 L826,703 L833,700 L839,698 L846,697 L852,697 L859,700 L866,700 L872,698 L879,699 L885,698 L892,699 L898,696 L905,695 L912,697 L918,696 L925,698 L931,698 L938,700 L944,703 L951,705 L958,705 L964,703 L971,704 L977,706 L984,707 L990,705 L997,703 L1003,702 L1010,701 L1017,701 L1023,702 L1030,703 L1036,705 L1043,702 L1049,702 L1056,700 L1062,701 L1069,700 L1076,699 L1082,699 L1089,701 L1095,701 L1102,700 L1108,703 L1115,704 L1122,702 L1128,699 L1135,698 L1141,697 L1148,696 L1154,697 L1161,695 L1168,693 L1174,694 L1181,695 L1187,694 L1194,692 L1200,694 L1207,693 L1213,691 L1220,692 L1227,692 L1233,692 L1240,693 L1246,693 L1253,694 L1259,693 L1266,696 L1272,696 L1279,699 L1286,699 L1292,699 L1299,698 L1305,697 L1312,694 L1318,693 L1325,690 L1332,692 L1338,691 L1345,691 L1351,689 L1358,689 L1364,687 L1371,688 L1378,690 L1384,691 L1391,689 L1397,690 L1404,691 L1410,695 L1417,698 L1423,701 L1430,701 L1437,703 L1443,702 L1450,703 L1456,700 L1463,701 L1469,705 L1476,705 L1482,706 L1489,705 L1496,706 L1502,705 L1509,705 L1515,702 L1522,701 L1528,700 L1535,699 L1542,699 L1548,703 L1555,704 L1561,706 L1568,708 L1574,707 L1581,706 L1588,703 L1594,704 L1601,704 L1607,704 L1614,706 L1620,709 L1627,708 L1633,710 L1640,709 L1640,900 L-40,900 Z" fill="#0a2630"/>\n<path d="M-40,798 L0,745 L41,798 Z M-32,767 L0,714 L32,767 Z M-23,736 L0,683 L23,736 Z M-4,798 h8 v-12 h-8 Z" fill="#07181f"/><path d="M1060,792 L1102,738 L1143,792 Z M1069,761 L1102,707 L1134,761 Z M1078,729 L1102,675 L1125,729 Z M1098,792 h8 v-12 h-8 Z" fill="#07181f"/><path d="M303,793 L360,718 L417,793 Z M316,750 L360,675 L405,750 Z M328,706 L360,632 L392,706 Z M356,793 h8 v-16 h-8 Z" fill="#07181f"/><path d="M1140,793 L1195,721 L1249,793 Z M1152,751 L1195,680 L1237,751 Z M1164,710 L1195,638 L1225,710 Z M1191,793 h8 v-16 h-8 Z" fill="#07181f"/><path d="M809,798 L858,734 L908,798 Z M820,761 L858,697 L897,761 Z M831,723 L858,659 L886,723 Z M854,798 h8 v-14 h-8 Z" fill="#07181f"/><path d="M1574,790 L1614,738 L1654,790 Z M1583,760 L1614,707 L1645,760 Z M1592,729 L1614,677 L1636,729 Z M1610,790 h8 v-11 h-8 Z" fill="#07181f"/><path d="M1473,794 L1521,731 L1569,794 Z M1484,757 L1521,695 L1559,757 Z M1494,721 L1521,658 L1548,721 Z M1517,794 h8 v-14 h-8 Z" fill="#07181f"/><path d="M475,809 L522,748 L569,809 Z M485,773 L522,712 L558,773 Z M495,737 L522,676 L548,737 Z M518,809 h8 v-13 h-8 Z" fill="#07181f"/><path d="M282,802 L325,745 L368,802 Z M291,769 L325,712 L359,769 Z M301,736 L325,679 L349,736 Z M321,802 h8 v-12 h-8 Z" fill="#07181f"/><path d="M816,807 L878,726 L940,807 Z M829,760 L878,679 L926,760 Z M843,713 L878,632 L912,713 Z M874,807 h8 v-18 h-8 Z" fill="#07181f"/><path d="M520,807 L563,751 L606,807 Z M530,774 L563,718 L597,774 Z M539,741 L563,685 L587,741 Z M559,807 h8 v-12 h-8 Z" fill="#07181f"/><path d="M1563,805 L1602,754 L1640,805 Z M1572,775 L1602,725 L1632,775 Z M1580,746 L1602,695 L1624,746 Z M1598,805 h8 v-11 h-8 Z" fill="#07181f"/><path d="M1350,794 L1404,723 L1458,794 Z M1362,753 L1404,682 L1446,753 Z M1374,712 L1404,641 L1434,712 Z M1400,794 h8 v-15 h-8 Z" fill="#07181f"/><path d="M1230,794 L1286,720 L1343,794 Z M1243,751 L1286,677 L1330,751 Z M1255,708 L1286,635 L1318,708 Z M1282,794 h8 v-16 h-8 Z" fill="#07181f"/><path d="M988,791 L1031,734 L1074,791 Z M997,758 L1031,701 L1065,758 Z M1007,725 L1031,668 L1055,725 Z M1027,791 h8 v-12 h-8 Z" fill="#07181f"/><path d="M485,798 L531,737 L577,798 Z M495,763 L531,702 L567,763 Z M505,727 L531,667 L557,727 Z M527,798 h8 v-13 h-8 Z" fill="#07181f"/><path d="M982,809 L1041,732 L1100,809 Z M995,764 L1041,687 L1087,764 Z M1008,720 L1041,642 L1074,720 Z M1037,809 h8 v-17 h-8 Z" fill="#07181f"/><path d="M1519,806 L1581,724 L1644,806 Z M1532,758 L1581,676 L1630,758 Z M1546,710 L1581,628 L1617,710 Z M1577,806 h8 v-18 h-8 Z" fill="#07181f"/><path d="M440,802 L482,747 L525,802 Z M449,770 L482,715 L515,770 Z M459,738 L482,683 L506,738 Z M478,802 h8 v-12 h-8 Z" fill="#07181f"/><path d="M820,792 L875,720 L930,792 Z M832,750 L875,678 L918,750 Z M844,708 L875,637 L906,708 Z M871,792 h8 v-16 h-8 Z" fill="#07181f"/><path d="M235,802 L296,722 L357,802 Z M249,756 L296,676 L344,756 Z M262,709 L296,629 L330,709 Z M292,802 h8 v-17 h-8 Z" fill="#07181f"/><path d="M1080,798 L1120,745 L1161,798 Z M1089,767 L1120,715 L1152,767 Z M1098,737 L1120,684 L1143,737 Z M1116,798 h8 v-11 h-8 Z" fill="#07181f"/><path d="M1418,810 L1473,739 L1527,810 Z M1430,769 L1473,698 L1515,769 Z M1442,727 L1473,656 L1503,727 Z M1469,810 h8 v-15 h-8 Z" fill="#07181f"/><path d="M254,806 L303,742 L352,806 Z M264,768 L303,704 L341,768 Z M275,731 L303,666 L330,731 Z M299,806 h8 v-14 h-8 Z" fill="#07181f"/><path d="M652,801 L709,726 L767,801 Z M664,757 L709,682 L754,757 Z M677,713 L709,638 L742,713 Z M705,801 h8 v-16 h-8 Z" fill="#07181f"/><path d="M133,810 L174,757 L214,810 Z M142,779 L174,726 L205,779 Z M151,748 L174,696 L196,748 Z M170,810 h8 v-12 h-8 Z" fill="#07181f"/><path d="M133,797 L176,741 L218,797 Z M142,764 L176,708 L209,764 Z M152,732 L176,676 L200,732 Z M172,797 h8 v-12 h-8 Z" fill="#07181f"/><path d="M1091,800 L1150,722 L1209,800 Z M1104,754 L1150,677 L1196,754 Z M1117,709 L1150,631 L1183,709 Z M1146,800 h8 v-17 h-8 Z" fill="#07181f"/><path d="M739,796 L797,720 L855,796 Z M752,752 L797,676 L842,752 Z M765,708 L797,632 L829,708 Z M793,796 h8 v-16 h-8 Z" fill="#07181f"/><path d="M537,803 L591,733 L644,803 Z M549,762 L591,692 L632,762 Z M561,722 L591,652 L621,722 Z M587,803 h8 v-15 h-8 Z" fill="#07181f"/><path d="M2,793 L42,740 L83,793 Z M11,762 L42,709 L74,762 Z M20,731 L42,678 L65,731 Z M38,793 h8 v-12 h-8 Z" fill="#07181f"/><path d="M1114,809 L1169,737 L1224,809 Z M1126,767 L1169,695 L1212,767 Z M1138,725 L1169,653 L1200,725 Z M1165,809 h8 v-16 h-8 Z" fill="#07181f"/><path d="M1195,805 L1239,747 L1283,805 Z M1204,772 L1239,714 L1273,772 Z M1214,738 L1239,680 L1264,738 Z M1235,805 h8 v-13 h-8 Z" fill="#07181f"/><path d="M1549,790 L1595,729 L1642,790 Z M1559,755 L1595,694 L1632,755 Z M1569,719 L1595,658 L1622,719 Z M1591,790 h8 v-13 h-8 Z" fill="#07181f"/><path d="M550,794 L595,735 L640,794 Z M560,759 L595,700 L630,759 Z M570,725 L595,666 L620,725 Z M591,794 h8 v-13 h-8 Z" fill="#07181f"/><path d="M13,807 L54,754 L95,807 Z M22,776 L54,722 L86,776 Z M31,745 L54,691 L77,745 Z M50,807 h8 v-12 h-8 Z" fill="#07181f"/>\n<path d="M39,876 L107,787 L175,876 Z M54,824 L107,736 L160,824 Z M69,773 L107,684 L145,773 Z M103,876 h8 v-19 h-8 Z" fill="#030c10"/><path d="M1377,884 L1456,780 L1536,884 Z M1394,824 L1456,719 L1518,824 Z M1412,763 L1456,659 L1501,763 Z M1452,884 h8 v-23 h-8 Z" fill="#030c10"/><path d="M64,887 L144,782 L225,887 Z M82,826 L144,721 L207,826 Z M99,765 L144,660 L189,765 Z M140,887 h8 v-23 h-8 Z" fill="#030c10"/><path d="M739,888 L837,759 L936,888 Z M761,813 L837,684 L914,813 Z M782,738 L837,609 L893,738 Z M833,888 h8 v-28 h-8 Z" fill="#030c10"/><path d="M530,885 L588,808 L647,885 Z M542,840 L588,763 L634,840 Z M555,795 L588,718 L621,795 Z M584,885 h8 v-17 h-8 Z" fill="#030c10"/><path d="M128,885 L187,807 L247,885 Z M141,840 L187,762 L233,840 Z M154,794 L187,717 L220,794 Z M183,885 h8 v-17 h-8 Z" fill="#030c10"/><path d="M1268,889 L1362,766 L1456,889 Z M1289,817 L1362,694 L1436,817 Z M1310,746 L1362,623 L1415,746 Z M1358,889 h8 v-27 h-8 Z" fill="#030c10"/><path d="M249,872 L311,791 L373,872 Z M262,825 L311,744 L359,825 Z M276,778 L311,696 L346,778 Z M307,872 h8 v-18 h-8 Z" fill="#030c10"/><path d="M1520,873 L1584,790 L1647,873 Z M1534,825 L1584,742 L1633,825 Z M1548,776 L1584,693 L1619,776 Z M1580,873 h8 v-18 h-8 Z" fill="#030c10"/><path d="M-48,871 L13,791 L74,871 Z M-35,824 L13,745 L60,824 Z M-21,778 L13,698 L47,778 Z M9,871 h8 v-17 h-8 Z" fill="#030c10"/><path d="M493,876 L559,790 L625,876 Z M508,826 L559,740 L610,826 Z M522,776 L559,690 L596,776 Z M555,876 h8 v-19 h-8 Z" fill="#030c10"/><path d="M1437,886 L1503,800 L1569,886 Z M1452,836 L1503,750 L1555,836 Z M1466,786 L1503,700 L1540,786 Z M1499,886 h8 v-19 h-8 Z" fill="#030c10"/><path d="M1108,882 L1191,773 L1274,882 Z M1126,819 L1191,710 L1255,819 Z M1145,756 L1191,647 L1237,756 Z M1187,882 h8 v-24 h-8 Z" fill="#030c10"/><path d="M1160,875 L1243,765 L1326,875 Z M1178,811 L1243,702 L1308,811 Z M1196,747 L1243,638 L1290,747 Z M1239,875 h8 v-24 h-8 Z" fill="#030c10"/><path d="M451,878 L520,788 L589,878 Z M466,825 L520,735 L574,825 Z M482,773 L520,682 L559,773 Z M516,878 h8 v-20 h-8 Z" fill="#030c10"/><path d="M1522,871 L1599,771 L1676,871 Z M1539,813 L1599,712 L1659,813 Z M1556,754 L1599,654 L1642,754 Z M1595,871 h8 v-22 h-8 Z" fill="#030c10"/><path d="M669,879 L762,757 L855,879 Z M689,808 L762,686 L834,808 Z M710,737 L762,616 L814,737 Z M758,879 h8 v-27 h-8 Z" fill="#030c10"/><path d="M1069,871 L1132,789 L1194,871 Z M1083,824 L1132,742 L1181,824 Z M1097,776 L1132,694 L1167,776 Z M1128,871 h8 v-18 h-8 Z" fill="#030c10"/><path d="M1004,876 L1065,796 L1126,876 Z M1018,830 L1065,750 L1113,830 Z M1031,783 L1065,704 L1099,783 Z M1061,876 h8 v-17 h-8 Z" fill="#030c10"/><path d="M544,871 L611,783 L678,871 Z M559,820 L611,732 L663,820 Z M573,769 L611,681 L648,769 Z M607,871 h8 v-19 h-8 Z" fill="#030c10"/><path d="M-108,884 L-9,754 L90,884 Z M-86,809 L-9,679 L68,809 Z M-64,733 L-9,604 L46,733 Z M-13,884 h8 v-28 h-8 Z" fill="#030c10"/><path d="M1461,889 L1541,785 L1620,889 Z M1479,829 L1541,725 L1603,829 Z M1496,768 L1541,664 L1585,768 Z M1537,889 h8 v-23 h-8 Z" fill="#030c10"/><path d="M1310,881 L1395,770 L1479,881 Z M1328,816 L1395,705 L1461,816 Z M1347,751 L1395,640 L1442,751 Z M1391,881 h8 v-24 h-8 Z" fill="#030c10"/><path d="M746,878 L814,788 L882,878 Z M761,826 L814,736 L867,826 Z M776,773 L814,684 L852,773 Z M810,878 h8 v-20 h-8 Z" fill="#030c10"/><path d="M1099,887 L1166,799 L1233,887 Z M1113,836 L1166,748 L1218,836 Z M1128,785 L1166,697 L1203,785 Z M1162,887 h8 v-19 h-8 Z" fill="#030c10"/><path d="M732,886 L816,776 L900,886 Z M750,822 L816,712 L882,822 Z M769,758 L816,648 L863,758 Z M812,886 h8 v-24 h-8 Z" fill="#030c10"/><path d="M975,875 L1040,790 L1104,875 Z M989,826 L1040,741 L1090,826 Z M1004,777 L1040,692 L1076,777 Z M1036,875 h8 v-18 h-8 Z" fill="#030c10"/><path d="M-78,889 L-18,811 L42,889 Z M-65,843 L-18,765 L28,843 Z M-52,798 L-18,719 L15,798 Z M-22,889 h8 v-17 h-8 Z" fill="#030c10"/><path d="M853,886 L953,755 L1052,886 Z M875,810 L953,680 L1030,810 Z M897,734 L953,604 L1008,734 Z M949,886 h8 v-28 h-8 Z" fill="#030c10"/><path d="M399,888 L498,758 L597,888 Z M420,813 L498,683 L575,813 Z M442,737 L498,607 L554,737 Z M494,888 h8 v-28 h-8 Z" fill="#030c10"/>\n</svg>\n',
+}
+
+# ----------------------------------------------------------- background picture
+
+LOOK_FILE = CONFIG_DIR / "loq-center" / "look.json"
+BACKGROUNDS = {"scenes": "Scenes", "picture": "My picture", "plain": "Plain"}
+# Which built-in scene (SCENE_SVG) each tab shows. A tab that is not listed (a plugin tab) uses "dashboard".
+TAB_SCENES = {"dashboard": "dashboard", "power": "power", "auto": "auto",
+              "display": "display", "graphics": "graphics"}
+DEFAULT_SCENE = "dashboard"
+
+
+def load_look():
+    look = {"background": "scenes", "picture": None}
+    try:
+        data = json.loads(LOOK_FILE.read_text())
+    except (OSError, ValueError):
+        return look
+    if isinstance(data, dict):
+        if data.get("background") in BACKGROUNDS:
+            look["background"] = data["background"]
+        if isinstance(data.get("picture"), str):
+            look["picture"] = data["picture"]
+    return look
+
+
+def save_look(look):
+    try:
+        LOOK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        part = LOOK_FILE.with_suffix(".tmp")
+        part.write_text(json.dumps(look, indent=2))
+        part.replace(LOOK_FILE)
+    except OSError as err:
+        raise ActionError(f"Could not save {LOOK_FILE}: {err}")
+
+
+def background_source(look):
+    """("image", path), ("scenes", None), ("art", None) or ("plain", None). Art stands in for a missing picture."""
+    choice = look["background"]
+    if choice == "plain":
+        return "plain", None
+    if choice == "picture" and look["picture"] and Path(look["picture"]).is_file():
+        return "image", Path(look["picture"]).resolve()
+    if choice == "scenes":
+        return "scenes", None
+    return "art", None
+
+
+def scene_class(page):
+    """CSS class that gives a tab its own wallpaper."""
+    return "scene-" + TAB_SCENES.get(page, DEFAULT_SCENE)
+
+
+def prepare_scenes():
+    """{scene name: PNG path} for the built-in wallpapers, drawn once into the cache. {} if none work."""
+    folder = CACHE_DIR / "loq-center"
+    found = {}
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as err:
+        log(f"no scene cache: {err}")
+        return found
+    for name, svg in SCENE_SVG.items():
+        target = folder / f"scene-{name}-{hashlib.sha1(svg.encode()).hexdigest()[:12]}.png"
+        try:
+            if not target.exists():
+                source = folder / f"scene-{name}.svg"
+                source.write_text(svg, encoding="utf-8")
+                part = target.with_suffix(".part")
+                scale_picture(source, part)  # needs the SVG loader of gdk-pixbuf (librsvg)
+                part.replace(target)
+            for old in folder.glob(f"scene-{name}-*.png"):
+                if old != target:
+                    old.unlink(missing_ok=True)
+            found[name] = target
+        except Exception as err:
+            log(f"scene {name} not drawn (is librsvg installed?): {err}")
+    return found
+
+
+def hex_rgb(value):
+    return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def mix(first, second, amount):
+    return tuple(round(a + (b - a) * amount) for a, b in zip(first, second))
+
+
+def write_png(path, width, height, pixels):
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+
+    stride = width * 3
+    rows = b"".join(b"\0" + bytes(pixels[y * stride:(y + 1) * stride]) for y in range(height))
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
+                     + chunk(b"IDAT", zlib.compress(rows, 6)) + chunk(b"IEND", b""))
+
+
+def draw_art(path, colors, width=1200, height=800):
+    """Draws a night landscape (sky, moon, stars, mountains) in the theme colours."""
+    bg, surface, accent, accent2 = (hex_rgb(colors[f"loq_{name}"])
+                                    for name in ("bg", "surface", "accent", "accent2"))
+    stride = width * 3
+    pixels = bytearray(stride * height)
+
+    def blend(x, y, color, amount):
+        at = y * stride + x * 3
+        pixels[at:at + 3] = bytes(mix(pixels[at:at + 3], color, amount))
+
+    horizon = mix(surface, accent, 0.45)
+    for y in range(height):
+        pixels[y * stride:(y + 1) * stride] = bytes(mix(bg, horizon, (y / height) ** 1.3)) * width
+
+    cx, cy, radius, reach = int(width * 0.76), int(height * 0.22), 52, 240
+    for y in range(max(0, cy - reach), min(height, cy + reach)):
+        for x in range(cx - reach, min(width, cx + reach)):
+            distance = math.hypot(x - cx, y - cy)
+            if distance < reach:
+                moon = max(0.0, min(1.0, radius + 0.5 - distance))
+                blend(x, y, accent2, max(moon, 0.45 * (1 - distance / reach) ** 2))
+
+    stars = random.Random(7)  # the same sky every time
+    for _ in range(190):
+        x, y = stars.randrange(width - 1), stars.randrange(int(height * 0.55))
+        light = stars.uniform(0.25, 0.9)
+        for dx in range(stars.choice((1, 1, 2))):
+            blend(x + dx, y, (255, 255, 255), light)
+
+    def peaks(value):
+        return abs((value % 1.0) * 2 - 1)
+
+    layers = ((0.66, 0.20, mix(surface, accent, 0.30), 0.15),
+              (0.76, 0.17, mix(surface, bg, 0.40), 0.62),
+              (0.90, 0.15, mix(bg, (0, 0, 0), 0.20), 0.37))
+    for base, rise, color, shift in layers:
+        for x in range(width):
+            u = x / width
+            ridge = (0.62 * peaks(u * 1.7 + shift) + 0.28 * peaks(u * 4.3 + shift * 3)
+                     + 0.10 * peaks(u * 13 + shift * 7))
+            top = (base - rise * ridge) * height
+            first = int(top)
+            blend(x, first, color, 1 - (top - first))  # smooth edge
+            below = height - first - 1
+            for channel in range(3):
+                start = (first + 1) * stride + x * 3 + channel
+                pixels[start::stride] = bytes([color[channel]]) * below
+    write_png(path, width, height, pixels)
+
+
+def scale_picture(source, target):
+    """A smaller copy, so that large wallpapers do not slow the window down."""
+    from gi.repository import GdkPixbuf
+    picture = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(source), 1600, 1200, True)
+    picture.savev(str(target), "png", [], [])
+
+
+def prepare_background(source, colors):
+    """A PNG in the cache that is ready to use behind the window, or None for plain."""
+    kind, path = source
+    if kind == "plain":
+        return None
+    folder = CACHE_DIR / "loq-center"
+
+    def cached(key, make):
+        target = folder / f"bg-{hashlib.sha1(key.encode()).hexdigest()[:16]}.png"
+        if not target.exists():
+            part = target.with_suffix(".part")
+            make(part)
+            part.replace(target)
+        for old in folder.glob("bg-*.png"):
+            if old != target:
+                old.unlink(missing_ok=True)
+        return target
+
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        if kind == "image":
+            try:
+                return cached(f"{path} {path.stat().st_mtime_ns}", lambda out: scale_picture(path, out))
+            except Exception as err:  # unreadable or unknown picture format
+                log(f"background picture {path} not used: {err}")
+        return cached("art 1 " + json.dumps(colors, sort_keys=True), lambda out: draw_art(out, colors))
+    except Exception as err:
+        log(f"no background picture: {err}")
+        return None
+
+
+# -------------------------------------------------------------------------- GUI
+
+def start_gui():
+    try:
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
+        from gi.repository import Gdk, GLib, Gtk
+    except (ImportError, ValueError) as err:
+        print(f"GTK is not available: {err}\nInstall python-gobject and gtk3 (or python3-gi).",
+              file=sys.stderr)
+        return 1
+    if Gdk.Display.get_default() is None:
+        print("No graphical session detected.", file=sys.stderr)
+        return 1
+    GLib.set_prgname("loq-center")
+    Gtk.Window.set_default_icon_name("loq-center")
+    app = Gtk.Application(application_id="dev.loqcenter.App")
+    state = {}
+
+    def activate(_app):
+        if "ui" not in state:
+            state["ui"] = Window(app, Gtk, Gdk, GLib)
+        state["ui"].window.present()
+
+    app.connect("activate", activate)
+    return app.run([])
+
+
+class Choice:
+    """A row of buttons where the active one is highlighted."""
+
+    def __init__(self, ui, on_pick):
+        self.ui, self.on_pick = ui, on_pick
+        self.box = ui.Gtk.Box(spacing=8)
+        self.box.set_homogeneous(True)
+        self.options, self.buttons = None, {}
+
+    def update(self, options, active):
+        options = list(options)
+        if options != self.options:
+            for child in self.box.get_children():
+                child.destroy()
+            self.options, self.buttons = options, {}
+            for value, label in options:
+                button = self.ui.Gtk.Button(label=label)
+                button.connect("clicked", lambda _w, v=value: self.on_pick(v))
+                button.set_sensitive(not self.ui.busy)
+                self.box.pack_start(button, True, True, 0)
+                self.buttons[value] = button
+                self.ui.actions.append(button)
+            self.box.show_all()
+        for value, button in self.buttons.items():
+            context = button.get_style_context()
+            if value == active:
+                context.add_class("active")
+            else:
+                context.remove_class("active")
+
+
+class Dropdown:
+    """A compact drop-down with the same update(options, active) shape as Choice."""
+
+    def __init__(self, ui, on_pick):
+        self.on_pick = on_pick
+        self.box = ui.Gtk.ComboBoxText()
+        self.box.set_hexpand(True)
+        self.options, self.values, self.quiet = None, {}, False
+        self.box.connect("changed", self.on_changed)
+        self.box.connect("scroll-event", self.on_scroll)
+
+    def update(self, options, active):
+        options = list(options)
+        self.quiet = True  # changes made here are not picks by the user
+        if options != self.options:
+            self.box.remove_all()
+            self.options = options
+            self.values = {str(value): value for value, _label in options}
+            for value, label in options:
+                self.box.append(str(value), label)
+        # Untouched when unchanged, so the periodic refresh does not disturb an open list
+        if self.box.get_active_id() != str(active):
+            self.box.set_active_id(str(active))
+        self.quiet = False
+
+    def on_changed(self, box):
+        key = box.get_active_id()
+        if not self.quiet and key in self.values:
+            self.on_pick(self.values[key])
+
+    def on_scroll(self, box, _event):
+        box.stop_emission_by_name("scroll-event")  # the wheel must not change a setting
+        return False
+
+
+FAN_RPM_FULL = 6000.0  # fan speed drawn at top speed and fully blue
+
+
+def fan_level(rpm):
+    """0 for a stopped or unknown fan, rising to 1 at FAN_RPM_FULL."""
+    if not rpm or rpm <= 0:
+        return 0.0
+    return min(1.0, rpm / FAN_RPM_FULL)
+
+
+def spin_rate_for(level):
+    """Turns per second drawn for a level between 0 and 1. A stopped fan does not turn.
+
+    The real speed is far too fast to draw, so this only has to look faster when the fan is
+    faster. At most 4.8 turns per second: at 60 frames per second that is under 30 degrees per
+    frame, less than half the 72 degrees between two blades, so the blades never seem to turn
+    backwards."""
+    return 0.0 if level <= 0 else 0.2 + 4.6 * level
+
+
+def spin_rate(rpm):
+    return spin_rate_for(fan_level(rpm))
+
+
+def speed_color(level):
+    """Red for a slow fan, then orange, yellow and green, to blue for a fast one."""
+    level = max(0.0, min(1.0, level))
+    red, green, blue = colorsys.hsv_to_rgb(220 / 360 * level, 0.62, 0.97)
+    return (red, green, blue, 1.0)
+
+
+def draw_fan(cr, width, height, angle, colors, active=True, blades=5):
+    """Draws a small fan with its blades turned by `angle` radians."""
+    cx, cy = width / 2, height / 2
+    radius = min(width, height) / 2 - 2
+    cr.set_line_width(2)
+    cr.set_source_rgba(*colors["ring"])
+    cr.new_path()
+    cr.arc(cx, cy, radius, 0, 2 * math.pi)
+    cr.stroke()
+    blade = colors["blade"] if active else (*colors["idle"][:3], 0.45)
+    cr.save()
+    cr.translate(cx, cy)
+    cr.rotate(angle)
+    for _ in range(blades):
+        cr.new_path()
+        cr.move_to(radius * 0.16, -radius * 0.04)
+        cr.curve_to(radius * 0.28, -radius * 0.70, radius * 0.80, -radius * 0.62,
+                    radius * 0.90, -radius * 0.14)
+        cr.curve_to(radius * 0.62, -radius * 0.02, radius * 0.40, radius * 0.10,
+                    radius * 0.16, radius * 0.08)
+        cr.close_path()
+        cr.set_source_rgba(*blade)
+        cr.fill()
+        cr.rotate(2 * math.pi / blades)
+    cr.restore()
+    cr.new_path()
+    cr.set_source_rgba(*(colors["hub"] if active else (*colors["idle"][:3], 0.6)))
+    cr.arc(cx, cy, radius * 0.17, 0, 2 * math.pi)
+    cr.fill()
+
+
+class FanWheel:
+    """A small fan on the Dashboard. It turns faster when the fan really runs faster."""
+
+    def __init__(self, ui, size=60):
+        self.ui = ui
+        self.area = ui.Gtk.DrawingArea()
+        self.area.set_size_request(size, size)
+        self.area.connect("draw", self.on_draw)
+        self.angle = 0.0
+        self.level = 0.0   # 0 to 1, drawn right now; eases towards the target
+        self.target = 0.0
+        self.rpm = None    # None: no reading
+
+    def set_rpm(self, rpm):
+        changed = (rpm is None) != (self.rpm is None)
+        self.rpm = rpm
+        self.target = fan_level(rpm)
+        if changed:
+            self.area.queue_draw()
+
+    def step(self, dt):
+        """Moves the blades for dt seconds. Speeding up and slowing down is gradual."""
+        before = self.level
+        self.level += (self.target - self.level) * min(1.0, dt * 3.0)
+        if abs(self.level - self.target) < 0.005:
+            self.level = self.target
+        moving = self.level > 0
+        if moving:
+            self.angle = (self.angle + spin_rate_for(self.level) * 2 * math.pi * dt) % (2 * math.pi)
+        if moving or self.level != before:
+            self.area.queue_draw()
+        return moving
+
+    def on_draw(self, area, cr):
+        context = area.get_style_context()
+
+        def pick(name, fallback):
+            found, color = context.lookup_color(name)
+            return (color.red, color.green, color.blue, 1.0) if found else fallback
+
+        blade = speed_color(self.level)
+        hub = tuple(c + (1.0 - c) * 0.45 for c in blade[:3]) + (1.0,)  # a lighter shade of the blades
+        colors = {"ring": pick("loq_border", (0.27, 0.28, 0.35, 1.0)),
+                  "blade": blade, "hub": hub,
+                  "idle": pick("loq_muted", (0.70, 0.72, 0.82, 1.0))}
+        draw_fan(cr, area.get_allocated_width(), area.get_allocated_height(),
+                 self.angle, colors, self.rpm is not None)
+        return False
+
+
+class WidgetsMixin:
+    """Widget helpers, plugin loading and show/hide."""
+
+    # ---- widgets
+    def vbox(self, spacing):
+        return self.Gtk.Box(orientation=self.Gtk.Orientation.VERTICAL, spacing=spacing)
+
+    def label(self, text, style=None):
+        widget = self.Gtk.Label(label=text)
+        widget.set_xalign(0)
+        widget.set_line_wrap(True)
+        widget.set_max_width_chars(60)
+        if style:
+            widget.get_style_context().add_class(style)
+        return widget
+
+    def header(self):
+        row = self.Gtk.Box(spacing=12)
+        row.pack_start(self.label("LOQ Center", "title"), False, False, 0)
+        self.subtitle = self.label("Reading hardware…", "chip")
+        self.subtitle.set_line_wrap(False)
+        self.subtitle.set_valign(self.Gtk.Align.CENTER)
+        row.pack_end(self.subtitle, False, False, 0)
+        return row
+
+    def status_line(self):
+        self.status = self.label("Ready", "status")
+        self.status.set_halign(self.Gtk.Align.START)
+        return self.status
+
+    def tab_bar(self):
+        switcher = self.Gtk.StackSwitcher()
+        switcher.set_stack(self.stack)
+        switcher.set_homogeneous(True)
+        switcher.set_spacing(8)
+        switcher.get_style_context().remove_class("linked")  # separate tabs, not one joined strip
+        return switcher
+
+    def page(self, name, title):
+        scroller = self.Gtk.ScrolledWindow()
+        box = self.vbox(12)
+        scroller.add(box)
+        self.stack.add_titled(scroller, name, title)
+        return box
+
+    def card(self, parent, heading):
+        box = self.vbox(8)
+        box.get_style_context().add_class("card")
+        box.pack_start(self.label(heading, "heading"), False, False, 0)
+        parent.pack_start(box, False, False, 0)
+        return box
+
+    def button(self, text, callback):
+        widget = self.Gtk.Button(label=text)
+        widget.connect("clicked", lambda _w: callback())
+        self.actions.append(widget)
+        return widget
+
+    def add(self, parent, widget):
+        parent.pack_start(widget, False, False, 0)
+        return widget
+
+    def add_css(self, css_text):
+        prov = self.Gtk.CssProvider()
+        prov.load_from_data(css_text.encode())
+        self.Gtk.StyleContext.add_provider_for_screen(
+            self.Gdk.Screen.get_default(), prov, self.Gtk.STYLE_PROVIDER_PRIORITY_USER + 2)
+        self.plugin_providers.append(prov)
+        return prov
+
+    def load_plugins(self):
+        if not PLUGIN_DIR.is_dir():
+            return
+        for path in sorted(PLUGIN_DIR.glob("*.py")):
+            try:
+                spec = importlib.util.spec_from_file_location(f"loq_plugin_{path.stem}", path)
+                if spec and spec.loader:
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    if callable(getattr(mod, "register", None)):
+                        mod.register(self)
+            except Exception as err:
+                print(f"Plugin {path.name} failed: {err}", file=sys.stderr)
+                log(f"plugin {path.name} failed: {traceback.format_exc()}")
+
+    def flag(self, widget, name, on):
+        """Add or remove a style class on a widget."""
+        context = widget.get_style_context()
+        if on:
+            context.add_class(name)
+        else:
+            context.remove_class(name)
+
+    def visible(self, widget, show):
+        widget.set_no_show_all(not show)
+        if show:
+            widget.show_all()
+        else:
+            widget.hide()
+
+
+class ActionsMixin:
+    """Background work, busy state, status line and dialogs."""
+
+    # ---- actions
+    def set_busy(self, busy):
+        self.busy = busy
+        self.actions = [w for w in self.actions if w.get_parent() is not None]
+        for widget in self.actions:
+            widget.set_sensitive(not busy)
+        self.scale.set_sensitive(not busy)
+
+    def say(self, text, error=False):
+        self.status.set_text(text)
+        context = self.status.get_style_context()
+        if error:
+            context.add_class("error")
+        else:
+            context.remove_class("error")
+
+    def background(self, work, done):
+        def runner():
+            try:
+                result, error = work(), None
+            except ActionError as err:
+                result, error = None, str(err)
+            except Exception as err:
+                log(f"unexpected error: {traceback.format_exc()}")
+                result, error = None, f"Unexpected error: {type(err).__name__}: {err}"
+
+            def finish():
+                done(result, error)
+                return False
+
+            self.GLib.idle_add(finish)
+
+        threading.Thread(target=runner, daemon=True).start()
+
+    def act(self, work, message="Working…", after=None):
+        if self.busy:
+            return
+        self.set_busy(True)
+        self.say(message)
+
+        def done(result, error):
+            self.set_busy(False)
+            self.say(error or result or "Done", bool(error))
+            self.refresh()
+            if after:
+                after(error)
+
+        self.background(work, done)
+
+    def confirm(self, title, body):
+        dialog = self.Gtk.MessageDialog(
+            transient_for=self.window, modal=True, message_type=self.Gtk.MessageType.WARNING,
+            buttons=self.Gtk.ButtonsType.OK_CANCEL, text=title)
+        dialog.format_secondary_text(body)
+        answer = dialog.run()
+        dialog.destroy()
+        return answer == self.Gtk.ResponseType.OK
+
+
+class DashboardMixin:
+    """Dashboard tab (stats, fans, presets)."""
+
+    def build_dashboard(self):
+        page = self.page("dashboard", "Dashboard")
+        grid = self.Gtk.Grid()
+        grid.set_column_homogeneous(True)
+        grid.set_column_spacing(10)
+        grid.set_row_spacing(10)
+        page.pack_start(grid, False, False, 0)
+        self.stats = {}
+        items = [("cpu_temp", "CPU temperature"), ("cpu_use", "CPU load"), ("memory", "Memory"),
+                 ("battery", "Battery"), ("watts", "Battery power"), ("fans", "Fans")]
+        for index, (key, title) in enumerate(items):
+            box = self.vbox(6)
+            box.get_style_context().add_class("card")
+            self.add(box, self.label(title, "muted"))
+            value = self.add(box, self.label("…", "value"))
+            bar = None
+            if key in ("cpu_temp", "cpu_use", "memory", "battery"):
+                bar = self.add(box, self.Gtk.ProgressBar())
+            if key == "fans":
+                wheels = self.Gtk.Box(spacing=10)
+                for _ in range(2):
+                    wheel = FanWheel(self)
+                    wheels.pack_start(wheel.area, False, False, 0)
+                    self.fan_wheels.append(wheel)
+                self.add(box, wheels)
+            self.stats[key] = (value, bar)
+            grid.attach(box, index % 3, index // 3, 1, 1)
+        card = self.card(page, "One-click presets")
+        row = self.Gtk.Box(spacing=8)
+        row.set_homogeneous(True)
+        self.preset_buttons = {}
+        for key, preset in PRESETS.items():
+            button = self.button(preset[0], lambda k=key: self.act(lambda: apply_preset(k)))
+            row.pack_start(button, True, True, 0)
+            self.preset_buttons[key] = button
+        self.add(card, row)
+
+
+class PowerMixin:
+    """Power tab (performance mode, charging, sleep timer)."""
+
+    def build_power(self):
+        page = self.page("power", "Power")
+        card = self.card(page, "Performance mode")
+        self.profile_row = Choice(self, lambda v: self.act(lambda: set_profile(v)))
+        self.add(card, self.profile_row.box)
+        self.profile_note = self.add(card, self.label("", "muted"))
+        card = self.card(page, "Battery charging")
+        self.charge_row = Choice(self, lambda v: self.act(lambda: set_charge(v)))
+        self.add(card, self.charge_row.box)
+        self.charge_note = self.add(card, self.label("", "muted"))
+        self.idle_card = self.card(page, "Sleep & idle timer (hypridle)")
+        self.idle_row = Choice(self, lambda v: self.act(lambda: set_idle(v)))
+        self.add(self.idle_card, self.idle_row.box)
+        self.idle_note = self.add(self.idle_card, self.label("", "muted"))
+        card = self.card(page, "Battery health")
+        self.health = self.add(card, self.label("…"))
+
+
+class SmartSwitchMixin:
+    """Smart Switch tab (settings per power source)."""
+
+    def build_auto(self):
+        page = self.page("auto", SWITCH_NAME)
+
+        # Hero: name, one-line status and the master switch
+        hero = self.vbox(0)
+        for name in ("card", "hero"):
+            hero.get_style_context().add_class(name)
+        top = self.Gtk.Box(spacing=16)
+        text = self.vbox(4)
+        self.add(text, self.label(SWITCH_NAME, "title2"))
+        self.auto_note = self.add(text, self.label("", "muted"))
+        top.pack_start(text, True, True, 0)
+        self.auto_switch = self.Gtk.Switch()
+        self.auto_switch.set_valign(self.Gtk.Align.CENTER)
+        self.auto_quiet = False
+        self.auto_switch.connect("notify::active", self.on_auto_switch)
+        top.pack_end(self.auto_switch, False, False, 0)
+        self.add(hero, top)
+        self.add(page, hero)
+
+        # One card per power source, side by side; the one in use is highlighted
+        cards = self.Gtk.Box(spacing=14)
+        cards.set_homogeneous(True)
+        self.auto_cards, self.auto_badges, self.auto_rows = {}, {}, {}
+        for source, title in AUTO_SOURCES.items():
+            card = self.vbox(16)
+            for name in ("card", "source"):
+                card.get_style_context().add_class(name)
+            head = self.Gtk.Box(spacing=8)
+            text = self.vbox(2)
+            self.add(text, self.label(title, "title2"))
+            self.add(text, self.label(SWITCH_HINTS[source], "muted"))
+            head.pack_start(text, True, True, 0)
+            badge = self.label("", "badge")
+            badge.set_line_wrap(False)
+            badge.set_valign(self.Gtk.Align.START)
+            head.pack_end(badge, False, False, 0)
+            self.add(card, head)
+            self.visible(badge, False)
+            rows = {}
+            for key, label in AUTO_TITLES.items():
+                field = self.vbox(6)
+                self.add(field, self.label(label, "caption"))
+                cell = Dropdown(self, lambda v, s=source, k=key: self.pick_auto(s, k, v))
+                self.add(field, cell.box)
+                self.actions.append(cell.box)  # locked while a change is being applied
+                self.add(card, field)
+                rows[key] = (field, cell)
+            cards.pack_start(card, True, True, 0)
+            self.auto_cards[source], self.auto_badges[source] = card, badge
+            self.auto_rows[source] = rows
+        self.add(page, cards)
+
+    def auto_view(self, config=None):
+        config = config or load_auto()
+        self.auto_quiet = True
+        self.auto_switch.set_active(config["enabled"])
+        self.auto_quiet = False
+        if not config["enabled"]:
+            self.auto_note.set_text("Off · different settings for charger and battery")
+        elif daemon_running():
+            self.auto_note.set_text("On · changes when you plug in or unplug")
+        else:
+            self.auto_note.set_text("On · starts when you log in or reopen this window")
+        for source, card in self.auto_cards.items():
+            current = source == self.auto_now
+            badge = self.auto_badges[source]
+            badge.set_text("● Active now" if config["enabled"] else "● Current")
+            self.visible(badge, current)
+            self.flag(card, "now", current)
+            self.flag(card, "dim", not config["enabled"])
+            for key, (field, cell) in self.auto_rows[source].items():
+                saved = config[source][key]
+                choices = auto_choices(key, source, self.auto_options, saved)
+                known = [value for value, _label in choices]
+                cell.update([("keep", "Keep")] + choices, saved if saved in known else "keep")
+                self.visible(field, bool(choices))
+
+    def on_auto_switch(self, switch, _param):
+        if not self.auto_quiet:
+            self.pick_auto_enabled(switch.get_active())
+
+    def pick_auto(self, source, key, value):
+        try:
+            config = load_auto()
+            config[source][key] = None if value == "keep" else value
+            save_auto(config)
+        except ActionError as err:
+            self.say(str(err), True)
+            return
+        self.auto_view(config)
+        if config["enabled"] and source == self.auto_now:  # in use right now, so apply it
+            self.act(lambda: apply_auto(source, key), "Applying…")
+        else:
+            self.say("Saved")
+
+    def pick_auto_enabled(self, enabled):
+        try:
+            config = load_auto()
+            config["enabled"] = enabled
+            save_auto(config)
+        except ActionError as err:
+            self.say(str(err), True)
+            self.auto_view()  # put the switch back
+            return
+        source = power_source()
+        if enabled:
+            start_daemon()
+        self.auto_view(config)
+        if enabled and source and not self.busy:
+            self.auto_last = source
+            self.act(lambda: apply_auto(source), "Applying settings…")
+        else:
+            self.say(f"{SWITCH_NAME} is {'on' if enabled else 'off'}.")
+
+    def auto_check(self, data):
+        """Fallback while no background service runs: switch when this window sees a change."""
+        source = {True: "ac", False: "battery"}.get(data["ac"])
+        if source is None:
+            return
+        if self.auto_last is None:
+            self.auto_last = source
+            return
+        if source == self.auto_last or self.busy:
+            return
+        self.auto_last = source
+        if load_auto()["enabled"] and not daemon_running():
+            self.act(lambda: apply_auto(source), "Switching settings…")
+
+
+class DisplayMixin:
+    """Display tab (refresh rate, brightness, background)."""
+
+    def build_display(self):
+        page = self.page("display", "Display")
+        card = self.card(page, "Refresh rate")
+        self.rate_row = Choice(self, lambda v: self.act(lambda: set_refresh(v)))
+        self.add(card, self.rate_row.box)
+        self.rate_note = self.add(card, self.label("", "muted"))
+        self.light_card = self.card(page, "Screen brightness")
+        self.scale = self.Gtk.Scale.new_with_range(self.Gtk.Orientation.HORIZONTAL, 5, 100, 1)
+        self.scale_quiet = False
+        self.scale_timer = None
+        self.scale.connect("value-changed", self.on_scale)
+        self.add(self.light_card, self.scale)
+        self.keyboard_card = self.card(page, "Keyboard light")
+        self.keyboard_row = Choice(self, lambda v: self.act(lambda: set_keyboard(v)))
+        self.add(self.keyboard_card, self.keyboard_row.box)
+        self.toggle_card = self.card(page, "Device switches")
+        self.toggle_rows = {}
+        for name, title in TOGGLE_LABELS.items():
+            box = self.vbox(4)
+            self.add(box, self.label(title))
+            row = Choice(self, lambda v, n=name: self.act(lambda: set_toggle(n, v)))
+            self.add(box, row.box)
+            self.add(self.toggle_card, box)
+            self.toggle_rows[name] = (box, row)
+        card = self.card(page, "App background")
+        self.look_row = Choice(self, self.pick_background)
+        self.add(card, self.look_row.box)
+        self.background_view()
+
+    def background_view(self):
+        options = list(BACKGROUNDS.items())
+        chosen = load_look()["background"]
+        if chosen not in dict(options):
+            chosen = "scenes"
+        self.look_row.update(options, chosen)
+
+    def pick_background(self, choice):
+        look = load_look()
+        if choice == "picture":  # clicking it again chooses a different one
+            picture = self.choose_picture()
+            if not picture:
+                return
+            look["picture"] = picture
+        look["background"] = choice
+        try:
+            save_look(look)
+        except ActionError as err:
+            self.say(str(err), True)
+            return
+        self.load_theme()
+        self.background_view()
+        self.say("Background changed")
+
+    def choose_picture(self):
+        dialog = self.Gtk.FileChooserDialog(title="Choose a background picture",
+                                            transient_for=self.window,
+                                            action=self.Gtk.FileChooserAction.OPEN)
+        dialog.add_buttons("Cancel", self.Gtk.ResponseType.CANCEL,
+                           "Use picture", self.Gtk.ResponseType.OK)
+        pictures = self.Gtk.FileFilter()
+        pictures.set_name("Pictures")
+        pictures.add_pixbuf_formats()
+        dialog.add_filter(pictures)
+        picked = dialog.get_filename() if dialog.run() == self.Gtk.ResponseType.OK else None
+        dialog.destroy()
+        return picked
+
+    def on_scale(self, scale):
+        if self.scale_quiet:
+            return
+        if self.scale_timer:
+            self.GLib.source_remove(self.scale_timer)
+        self.scale_timer = self.GLib.timeout_add(200, self.apply_scale)
+
+    def apply_scale(self):
+        self.scale_timer = None
+        value = self.scale.get_value()
+
+        def done(result, error):
+            self.say(error or result, bool(error))
+
+        self.background(lambda: set_brightness(value), done)
+        return False
+
+
+class GraphicsMixin:
+    """Graphics tab (NVIDIA sensors, GPU / MUX mode)."""
+
+    def build_graphics(self):
+        page = self.page("graphics", "Graphics")
+        card = self.card(page, "NVIDIA GPU")
+        self.gpu_power = self.add(card, self.label("…"))
+        self.gpu_values = self.add(card, self.label("Live values are read only on request, "
+                                                    "so the GPU can sleep.", "muted"))
+        self.add(card, self.button("Read GPU sensors", self.read_gpu))
+        card = self.card(page, "GPU mode (needs reboot)")
+        self.mode_label = self.add(card, self.label("Checking…"))
+        self.mode_row = Choice(self, self.ask_gpu)
+        self.add(card, self.mode_row.box)
+        self.add(card, self.label("Integrated: NVIDIA is switched off.\n"
+                                  "Hybrid: Intel runs the desktop; start a game with prime-run.\n"
+                                  "dGPU only: NVIDIA drives the screen. Uses more battery.",
+                                  "muted"))
+        self.reboot = self.add(card, self.button("Reboot now", self.ask_reboot))
+        self.reboot.set_no_show_all(True)
+
+    def read_gpu(self):
+        def done(result, error):
+            self.set_busy(False)
+            self.gpu_values.set_text(error or result)
+            self.say(error or "GPU sensors read", bool(error))
+
+        if self.busy:
+            return
+        if nvidia_state() == "off":
+            self.gpu_values.set_text("The NVIDIA GPU is switched off.")
+            return
+        self.set_busy(True)
+        self.background(gpu_stats, done)
+
+    def ask_gpu(self, mode):
+        if self.busy or self.gpu_current is None:
+            return
+        kind, message = gpu_action(mode, graphics_state())
+        if kind in ("none", "blocked"):
+            self.say(message, kind == "blocked")
+            return
+        if kind == "mux":
+            title = f"Switch screen to {GPU_LABELS[mode]}?"
+            body = "This changes a firmware setting. It takes effect after a reboot."
+            if mode == "dgpu":
+                body += ("\n\nBattery life will be much shorter. This is new and not yet tested "
+                         "on real hardware.\n\nIf the screen stays black after reboot: restart, "
+                         "press F2, and set Graphics Device back to the switchable option.")
+                if os.environ.get("AQ_DRM_DEVICES"):
+                    body += ("\n\nWARNING: AQ_DRM_DEVICES is set in your Hyprland config. "
+                             "Remove it first, or the desktop may not start.")
+            work, wait = (lambda: set_mux(mode)), "Asking the firmware…"
+        else:
+            title = f"Switch GPU to {GPU_LABELS[mode]}?"
+            body = ("Save your work first. This rewrites driver settings and rebuilds the boot "
+                    "image, which can take a few minutes. Do not power off until it finishes.\n\n"
+                    "If the screen stays black after reboot, press Ctrl+Alt+F3, log in and run:\n"
+                    "sudo envycontrol -s hybrid && sudo reboot")
+            if mode == "integrated":
+                body += "\n\nExternal screens on NVIDIA-wired ports (often HDMI) will stop working."
+            work, wait = (lambda: set_gpu(mode)), "Switching GPU mode. Please wait…"
+        if not self.confirm(title, body):
+            return
+
+        def after(error):
+            self.refresh_gpu_mode()
+            if not error:
+                self.reboot.set_no_show_all(False)
+                self.reboot.show_all()
+
+        self.act(work, wait, after)
+
+    def ask_reboot(self):
+        if self.confirm("Reboot now?", "Unsaved work will be lost."):
+            def reboot():
+                code, _, err = run(["systemctl", "reboot"])
+                if code != 0:
+                    raise ActionError(err or "Reboot failed.")
+                return "Rebooting…"
+            self.act(reboot)
+
+    def refresh_gpu_mode(self):
+        def done(state, error):
+            self.gpu_current = state
+            if error:
+                self.mode_label.set_text(error)
+                return
+            options = [(name, label) for name, label in GPU_LABELS.items()
+                       if name != "integrated" or state["config"] is not None]
+            if state["pending"]:
+                text = f"{GPU_LABELS[state['pending']]} selected. Reboot to apply."
+            elif state["dgpu"]:
+                text = "Running now: dGPU only (the screen is on NVIDIA)."
+            elif state["config"] is None:
+                text = "Integrated mode needs the optional tool envycontrol (not installed)."
+            else:
+                text = f"Configured mode: {state['config']}"
+            self.mode_label.set_text(text)
+            self.mode_row.update(options, selected_gpu(state))
+
+        self.background(graphics_state, done)
+
+
+class RefreshMixin:
+    """Periodic refresh and filling the tabs with fresh data."""
+
+    # ---- refresh
+    def spin(self):
+        """Turns the Dashboard fans. Does nothing while another tab is showing."""
+        now = time.monotonic()
+        dt = min(now - self.spin_last, 0.25)
+        self.spin_last = now
+        if self.stack.get_visible_child_name() == "dashboard" and self.window.is_visible():
+            for wheel in self.fan_wheels:
+                wheel.step(dt)
+        return True
+
+    def tick(self):
+        self.load_theme()
+        self.refresh()
+        return True
+
+    def refresh(self):
+        if self.reading:
+            return
+        self.reading = True
+
+        def done(data, error):
+            self.reading = False
+            if error:
+                self.say(error, True)
+            else:
+                self.show_data(data)
+
+        self.background(lambda: snapshot(self.meter, self.fan_watcher), done)
+
+    def stat(self, key, text, fraction=None):
+        value, bar = self.stats[key]
+        value.set_text(text)
+        if bar is not None:
+            bar.set_fraction(max(0.0, min(1.0, fraction or 0.0)))
+
+    def show_data(self, data):
+        temp, use, memory, battery = (data[k] for k in ("cpu_temp", "cpu_use", "memory", "battery"))
+        self.stat("cpu_temp", "n/a" if temp is None else f"{temp:.0f} °C", (temp or 0) / 100)
+        self.stat("cpu_use", "…" if use is None else f"{use:.0f}%", (use or 0) / 100)
+        if memory:
+            self.stat("memory", f"{memory[0]:.1f} / {memory[1]:.1f} GiB", memory[0] / memory[1])
+        else:
+            self.stat("memory", "n/a")
+        if battery and battery["capacity"] is not None:
+            self.stat("battery", f"{battery['capacity']}%", battery["capacity"] / 100)
+        else:
+            self.stat("battery", "n/a")
+        watts = battery["watts"] if battery else None
+        self.stat("watts", "n/a" if watts is None else f"{watts:.1f} W")
+        self.stat("fans", "  ".join(f"{v}" for v in data["fans"]) + " RPM" if data["fans"] else "n/a")
+        fans = data["fans"]
+        for index, wheel in enumerate(self.fan_wheels):
+            wheel.set_rpm(fans[index] if index < len(fans) else None)
+            self.visible(wheel.area, index < max(1, len(fans)))
+
+        source = {True: "On charger", False: "On battery", None: "Power source unknown"}[data["ac"]]
+        status = f" · {battery['status']}" if battery else ""
+        self.subtitle.set_text(source + status)
+
+        profile = data["profile"]
+        unplugged = data["ac"] is False
+        self.visible(self.preset_buttons["boost"], not unplugged)
+        if profile:
+            usable = usable_profiles(profile["options"], "battery" if unplugged else "ac")
+            self.profile_row.update([(p, PROFILE_LABELS.get(p, p)) for p in usable],
+                                    profile["active"])
+            active = PROFILE_LABELS.get(profile["active"], profile["active"] or "Unknown")
+            if unplugged and profile["active"] in CHARGER_ONLY:
+                note = f"{active} needs the charger. Plug it in, or pick another mode."
+            elif profile["active"] == "cooling":
+                fans = ("Fans at full speed." if profile["fans_direct"] else
+                        "Fans are NOT at full speed: no working fan interface.")
+                note = f"Cooling (purple): low power. {fans} Pick another mode to restore."
+            elif profile["active"] == "ultra-saver":
+                note = ("Ultra saver: Quiet mode, no CPU turbo, about half CPU speed. "
+                        "Pick another mode to restore.")
+            elif profile["active"] == "max-power":
+                note = "Max power (purple): high power. Keep the charger connected."
+            elif unplugged:
+                note = f"Current: {active}. Plug in for Performance, Max power and Cooling."
+            else:
+                note = f"Current: {active}. Fn+Q changes it too."
+            self.profile_note.set_text(note)
+        else:
+            self.profile_row.update([], None)
+            self.profile_note.set_text("This kernel exposes no performance modes.")
+
+        charge = data["charge"]
+        if charge:
+            self.charge_row.update([(c, CHARGE_LABELS[c]) for c in charge["options"]], charge["active"])
+            self.charge_note.set_text(charge_note(charge, battery, data["ac"]))
+        else:
+            self.charge_row.update([], None)
+            self.charge_note.set_text("Not available. Check that ideapad_laptop is loaded.")
+
+        idle = data["idle"]
+        self.visible(self.idle_card, idle is not None)
+        if idle:
+            self.idle_row.update([(k, v[0]) for k, v in IDLE_PRESETS.items()], idle["active"])
+            self.idle_note.set_text(idle["note"])
+
+        lines = []
+        if battery:
+            if battery["health"] is not None:
+                lines.append(f"Capacity left compared with new: {battery['health']:.1f}%")
+            if battery["cycles"] is not None:
+                lines.append(f"Charge cycles: {battery['cycles']}")
+        self.health.set_text("\n".join(lines) or "No health data reported.")
+
+        screen = data["display"]
+        if screen and screen["options"]:
+            self.rate_row.update([(r, f"{r} Hz") for r in screen["options"]], screen["active"])
+            self.rate_note.set_text(f"{screen['name']}: {screen['active']} Hz. "
+                                    "Resets when Hyprland reloads.")
+        else:
+            self.rate_row.update([], None)
+            self.rate_note.set_text("Built-in screen not found through hyprctl.")
+
+        light = data["backlight"]
+        self.visible(self.light_card, light is not None)
+        if light and not self.scale_timer and not self.scale.has_focus():
+            self.scale_quiet = True
+            self.scale.set_value(round(light["value"] * 100 / light["max"]))
+            self.scale_quiet = False
+
+        keys = data["keyboard"]
+        self.visible(self.keyboard_card, keys is not None)
+        if keys:
+            self.keyboard_row.update(
+                [(n, "Off" if n == 0 else str(n)) for n in range(keys["max"] + 1)], keys["value"])
+
+        toggles = data["toggles"]
+        self.visible(self.toggle_card, bool(toggles))
+        for name, (box, row) in self.toggle_rows.items():
+            self.visible(box, name in toggles)
+            if name in toggles:
+                row.update([("1", "On"), ("0", "Off")], toggles[name])
+
+        states = {"active": "awake", "suspended": "sleeping (saving power)",
+                  "off": "switched off or not detected"}
+        self.gpu_power.set_text(f"State: {states.get(data['nvidia'], data['nvidia'])}")
+
+        self.auto_now = {True: "ac", False: "battery"}.get(data["ac"])
+        self.auto_options = {
+            "profile": profile["options"] if profile else [],
+            "refresh": list(screen["options"]) if screen and screen["options"] else [],
+            "idle": idle is not None,
+            "brightness": light is not None,
+        }
+        self.auto_view()
+        self.auto_check(data)
+
+
+class Window(WidgetsMixin, ActionsMixin, DashboardMixin, PowerMixin, SmartSwitchMixin, DisplayMixin, GraphicsMixin, RefreshMixin):
+    """The LOQ Center window. Each tab lives in its own mixin under ui/window/."""
+    def __init__(self, app, Gtk, Gdk, GLib):
+        self.Gtk, self.Gdk, self.GLib = Gtk, Gdk, GLib
+        self.busy = False
+        self.reading = False
+        self.gpu_current = None  # graphics_state() once it is read
+        self.actions = []
+        self.meter = CpuMeter()
+        self.fan_watcher = FanWatcher()
+        self.theme_stamp = None
+        self.scenes_on = False
+        self.fan_wheels = []
+        self.spin_last = time.monotonic()
+        self.auto_last = None  # power source seen on the previous refresh
+        self.auto_now = None  # power source highlighted on the Auto tab
+        self.auto_options = {"profile": [], "refresh": [], "idle": False, "brightness": False}
+        self.Choice = Choice
+        self.ActionError = ActionError
+        self.CONFIG_DIR = CONFIG_DIR
+        self.DATA_DIR = DATA_DIR
+        self.THEME_FILE = THEME_FILE
+        self.read = read
+        self.plugin_providers = []
+        self.provider = Gtk.CssProvider()
+        self.load_theme()
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), self.provider, Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
+
+        self.window = Gtk.ApplicationWindow(application=app, title="LOQ Center")
+        self.window.set_default_size(880, 640)
+        self.window.get_style_context().add_class("loq")
+        self.window.connect("key-press-event", self.on_key)
+        self.window.connect("delete-event", self.on_close)
+
+        root = self.vbox(12)
+        root.set_border_width(18)
+        self.window.add(root)
+        root.pack_start(self.header(), False, False, 0)
+
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_transition_duration(180)
+        self.stack.connect("notify::visible-child-name", lambda *_: self.apply_scene())
+        root.pack_start(self.tab_bar(), False, False, 0)
+        root.pack_start(self.stack, True, True, 0)
+        self.build_dashboard()
+        self.build_power()
+        self.build_auto()
+        self.build_display()
+        self.build_graphics()
+        self.load_plugins()
+
+        root.pack_end(self.status_line(), False, False, 0)
+        self.window.show_all()
+        self.window.set_focus(None)  # no focus outline on the first tab at startup
+        self.apply_scene()
+        self.refresh()
+        self.refresh_gpu_mode()
+        GLib.timeout_add_seconds(2, self.tick)
+        GLib.timeout_add(16, self.spin)  # about 60 frames per second
+        if load_auto()["enabled"]:
+            start_daemon()  # keeps switching after this window is closed
+
+    # ---- window
+    def load_theme(self):
+        """Reloads the style when the colours, the background choice or the wallpaper change."""
+        try:
+            colors_stamp = THEME_FILE.stat().st_mtime_ns
+        except OSError:
+            colors_stamp = 0
+        source = background_source(load_look())
+        try:
+            picture_stamp = source[1].stat().st_mtime_ns if source[1] else 0
+        except OSError:
+            picture_stamp = 0
+        stamp = (colors_stamp, source, picture_stamp)
+        if stamp == self.theme_stamp:
+            return
+        theme = read(THEME_FILE)
+        scenes = prepare_scenes() if source[0] == "scenes" else {}
+        picture = None if scenes else prepare_background(source, theme_colors(theme))
+        if scenes:
+            attempts = [(None, scenes), (None, None)]
+        else:
+            attempts = [(picture, None), (None, None)] if picture else [(None, None)]
+        for use, tabs in attempts:  # plain colours if the pictures fail
+            try:
+                self.provider.load_from_data(build_css(theme, use, tabs).encode())
+                self.theme_stamp = stamp
+                self.scenes_on = bool(tabs)
+                self.apply_scene()
+                return
+            except self.GLib.Error as err:
+                log(f"theme not applied: {err}")
+                print(f"Theme not applied: {err}", file=sys.stderr)
+
+    def apply_scene(self):
+        """Gives the window the wallpaper of the tab that is showing."""
+        window = getattr(self, "window", None)
+        if window is None:
+            return
+        context = window.get_style_context()
+        for name in set(TAB_SCENES.values()) | {DEFAULT_SCENE}:
+            context.remove_class(f"scene-{name}")
+        if getattr(self, "scenes_on", False):
+            context.add_class(scene_class(self.stack.get_visible_child_name()))
+
+    def on_key(self, _window, event):
+        if event.keyval == self.Gdk.KEY_Escape:
+            self.window.close()
+            return True
+        return False
+
+    def on_close(self, *_):
+        if self.busy:
+            self.say("Please wait for the current task to finish.", True)
+            return True
+        return False
+
+
+def main(argv):
+    if argv[1:] == ["--version"]:
+        print(VERSION)
+        return 0
+    if argv[1:] == ["--status"]:
+        meter = CpuMeter()
+        data = snapshot(meter)
+        data["gpu_mode"] = gpu_mode()
+        data["helper_installed"] = os.path.exists(HELPER)
+        print(json.dumps(data, indent=2))
+        return 0
+    if argv[1:] == ["--daemon"]:
+        return daemon_main()
+    if argv[1:]:
+        print("Usage: loq-center [--status | --version | --daemon]", file=sys.stderr)
+        return 2
+    return start_gui()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

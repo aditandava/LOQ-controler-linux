@@ -1,0 +1,121 @@
+class Window(WidgetsMixin, ActionsMixin, DashboardMixin, PowerMixin, SmartSwitchMixin, DisplayMixin, GraphicsMixin, RefreshMixin):
+    """The LOQ Center window. Each tab lives in its own mixin under ui/window/."""
+    def __init__(self, app, Gtk, Gdk, GLib):
+        self.Gtk, self.Gdk, self.GLib = Gtk, Gdk, GLib
+        self.busy = False
+        self.reading = False
+        self.gpu_current = None  # graphics_state() once it is read
+        self.actions = []
+        self.meter = CpuMeter()
+        self.fan_watcher = FanWatcher()
+        self.theme_stamp = None
+        self.scenes_on = False
+        self.fan_wheels = []
+        self.spin_last = time.monotonic()
+        self.auto_last = None  # power source seen on the previous refresh
+        self.auto_now = None  # power source highlighted on the Auto tab
+        self.auto_options = {"profile": [], "refresh": [], "idle": False, "brightness": False}
+        self.Choice = Choice
+        self.ActionError = ActionError
+        self.CONFIG_DIR = CONFIG_DIR
+        self.DATA_DIR = DATA_DIR
+        self.THEME_FILE = THEME_FILE
+        self.read = read
+        self.plugin_providers = []
+        self.provider = Gtk.CssProvider()
+        self.load_theme()
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), self.provider, Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
+
+        self.window = Gtk.ApplicationWindow(application=app, title="LOQ Center")
+        self.window.set_default_size(880, 640)
+        self.window.get_style_context().add_class("loq")
+        self.window.connect("key-press-event", self.on_key)
+        self.window.connect("delete-event", self.on_close)
+
+        root = self.vbox(12)
+        root.set_border_width(18)
+        self.window.add(root)
+        root.pack_start(self.header(), False, False, 0)
+
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_transition_duration(180)
+        self.stack.connect("notify::visible-child-name", lambda *_: self.apply_scene())
+        root.pack_start(self.tab_bar(), False, False, 0)
+        root.pack_start(self.stack, True, True, 0)
+        self.build_dashboard()
+        self.build_power()
+        self.build_auto()
+        self.build_display()
+        self.build_graphics()
+        self.load_plugins()
+
+        root.pack_end(self.status_line(), False, False, 0)
+        self.window.show_all()
+        self.window.set_focus(None)  # no focus outline on the first tab at startup
+        self.apply_scene()
+        self.refresh()
+        self.refresh_gpu_mode()
+        GLib.timeout_add_seconds(2, self.tick)
+        GLib.timeout_add(16, self.spin)  # about 60 frames per second
+        if load_auto()["enabled"]:
+            start_daemon()  # keeps switching after this window is closed
+
+    # ---- window
+    def load_theme(self):
+        """Reloads the style when the colours, the background choice or the wallpaper change."""
+        try:
+            colors_stamp = THEME_FILE.stat().st_mtime_ns
+        except OSError:
+            colors_stamp = 0
+        source = background_source(load_look())
+        try:
+            picture_stamp = source[1].stat().st_mtime_ns if source[1] else 0
+        except OSError:
+            picture_stamp = 0
+        stamp = (colors_stamp, source, picture_stamp)
+        if stamp == self.theme_stamp:
+            return
+        theme = read(THEME_FILE)
+        scenes = prepare_scenes() if source[0] == "scenes" else {}
+        picture = None if scenes else prepare_background(source, theme_colors(theme))
+        if scenes:
+            attempts = [(None, scenes), (None, None)]
+        else:
+            attempts = [(picture, None), (None, None)] if picture else [(None, None)]
+        for use, tabs in attempts:  # plain colours if the pictures fail
+            try:
+                self.provider.load_from_data(build_css(theme, use, tabs).encode())
+                self.theme_stamp = stamp
+                self.scenes_on = bool(tabs)
+                self.apply_scene()
+                return
+            except self.GLib.Error as err:
+                log(f"theme not applied: {err}")
+                print(f"Theme not applied: {err}", file=sys.stderr)
+
+    def apply_scene(self):
+        """Gives the window the wallpaper of the tab that is showing."""
+        window = getattr(self, "window", None)
+        if window is None:
+            return
+        context = window.get_style_context()
+        for name in set(TAB_SCENES.values()) | {DEFAULT_SCENE}:
+            context.remove_class(f"scene-{name}")
+        if getattr(self, "scenes_on", False):
+            context.add_class(scene_class(self.stack.get_visible_child_name()))
+
+    def on_key(self, _window, event):
+        if event.keyval == self.Gdk.KEY_Escape:
+            self.window.close()
+            return True
+        return False
+
+    def on_close(self, *_):
+        if self.busy:
+            self.say("Please wait for the current task to finish.", True)
+            return True
+        return False
+
+
