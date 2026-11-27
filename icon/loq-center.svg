@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>LOQ Center</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a2b3d"/>
+      <stop offset="1" stop-color="#1e1e2e"/>
+    </linearGradient>
+    <linearGradient id="s1" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#d9b8f7"/>
+      <stop offset="1" stop-color="#c79bf0"/>
+    </linearGradient>
+    <linearGradient id="s2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f3cfcb"/>
+      <stop offset="1" stop-color="#ebbcba"/>
+    </linearGradient>
+    <linearGradient id="s3" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#a47be0"/>
+      <stop offset="1" stop-color="#7f5cc4"/>
+    </linearGradient>
+    <radialGradient id="core" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#c79bf0" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#c79bf0" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg)"/>
+  <rect x="17.5" y="17.5" width="477" height="477" rx="110.5" fill="none" stroke="#45475a" stroke-width="3"/>
+
+  <!-- the O of LOQ, cut into three sections -->
+  <g fill="none" stroke-width="62" stroke-linecap="butt">
+    <path d="M275.58 107.28 A150 150 0 0 1 394.58 313.40" stroke="url(#s1)"/>
+    <path d="M375.00 347.31 A150 150 0 0 1 137.00 347.31" stroke="url(#s2)"/>
+    <path d="M117.42 313.40 A150 150 0 0 1 236.42 107.28" stroke="url(#s3)"/>
+  </g>
+
+  <!-- core -->
+  <circle cx="256" cy="256" r="86" fill="url(#core)"/>
+  <circle cx="256" cy="256" r="30" fill="#c79bf0"/>
+  <circle cx="256" cy="256" r="30" fill="none" stroke="#1e1e2e" stroke-width="6" opacity="0.35"/>
+</svg>
