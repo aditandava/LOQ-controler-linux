@@ -11,11 +11,13 @@ class SmartSwitchMixin:
         self.add(text, self.label(SWITCH_NAME, "heading"))
         self.auto_note = self.add(text, self.label("", "muted"))
         top.pack_start(text, True, True, 0)
-        self.auto_switch = self.Gtk.Switch()
-        self.auto_switch.set_valign(self.Gtk.Align.CENTER)
+        self.auto_button = self.Gtk.ToggleButton(label="Off")
+        self.auto_button.get_style_context().add_class("pill-toggle")
+        self.auto_button.set_valign(self.Gtk.Align.CENTER)
         self.auto_quiet = False
-        self.auto_switch.connect("notify::active", self.on_auto_switch)
-        top.pack_end(self.auto_switch, False, False, 0)
+        self.auto_button.connect("toggled", self.on_auto_toggle)
+        self.actions.append(self.auto_button)
+        top.pack_end(self.auto_button, False, False, 0)
         self.add(card, top)
 
         grid = self.Gtk.Grid()
@@ -48,10 +50,17 @@ class SmartSwitchMixin:
 
     def auto_view(self, config=None):
         config = config or load_auto()
+        enabled = config["enabled"]
         self.auto_quiet = True
-        self.auto_switch.set_active(config["enabled"])
+        self.auto_button.set_active(enabled)
+        self.auto_button.set_label("● Enabled" if enabled else "○ Disabled")
+        btn_ctx = self.auto_button.get_style_context()
+        if enabled:
+            btn_ctx.add_class("active")
+        else:
+            btn_ctx.remove_class("active")
         self.auto_quiet = False
-        if not config["enabled"]:
+        if not enabled:
             self.auto_note.set_text("Off · different settings for charger and battery")
         elif daemon_running():
             self.auto_note.set_text("On · changes when you plug in or unplug")
@@ -74,9 +83,9 @@ class SmartSwitchMixin:
                 self.visible(cell.box, bool(choices))
             self.visible(name, any(auto_choices(key, s, self.auto_options) for s in cells))
 
-    def on_auto_switch(self, switch, _param):
+    def on_auto_toggle(self, button):
         if not self.auto_quiet:
-            self.pick_auto_enabled(switch.get_active())
+            self.pick_auto_enabled(button.get_active())
 
     def pick_auto(self, source, key, value):
         try:
@@ -124,5 +133,3 @@ class SmartSwitchMixin:
         self.auto_last = source
         if load_auto()["enabled"] and not daemon_running():
             self.act(lambda: apply_auto(source), "Switching settings…")
-
-
