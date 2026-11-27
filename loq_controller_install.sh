@@ -52,6 +52,7 @@ remove_hooks() {
 
 if [ "${1:-}" = "--uninstall" ]; then
   say "Removing LOQ Center"
+  pkill -u "$(id -u)" -f 'loq-center --daemon' >/dev/null 2>&1 || true
   remove_hooks
   rm -f "$BIN/loq-center" "$DESKTOP" "$DCOL" "$CONFIG/loq-center/theme.css" "$ICON"
   refresh_icons
@@ -152,6 +153,7 @@ cat > "$work/loq-center" <<'LOQ_FILE_LOQ_CENTER'
 Everything shown is detected at runtime. A control only appears when the kernel
 or a tool on this machine really provides it.
 """
+import fcntl
 import importlib.util
 import json
 import os
@@ -163,7 +165,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "1.8"
+VERSION = "1.9"
 SYS = Path("/sys")
 PROC = Path("/proc")
 HELPER = "/usr/local/libexec/loq-center-helper"
@@ -937,6 +939,196 @@ def apply_preset(key):
     return f"{title} applied" if done else f"{title}: nothing to change"
 
 
+# --------------------------------------------- settings per power source (auto switch)
+
+AUTO_FILE = CONFIG_DIR / "loq-center" / "auto.json"
+AUTO_SOURCES = {"ac": "On charger", "battery": "On battery"}
+AUTO_KEYS = ("profile", "refresh", "idle", "brightness")
+AUTO_BRIGHTNESS = (30, 50, 70, 100)
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def clean_auto_value(key, value):
+    """A saved value that makes sense, or None, which means 'leave this setting alone'."""
+    if key == "profile":
+        return value if isinstance(value, str) and re.fullmatch(r"[a-z-]{2,30}", value) else None
+    if key == "refresh":
+        return value if _is_int(value) and 24 <= value <= 500 else None
+    if key == "idle":
+        return value if _is_int(value) and value in IDLE_PRESETS else None
+    if key == "brightness":
+        return value if _is_int(value) and 5 <= value <= 100 else None
+    return None
+
+
+def load_auto():
+    config = {"enabled": False, **{s: dict.fromkeys(AUTO_KEYS) for s in AUTO_SOURCES}}
+    try:
+        data = json.loads(AUTO_FILE.read_text())
+    except (OSError, ValueError):
+        return config
+    if not isinstance(data, dict):
+        return config
+    config["enabled"] = data.get("enabled") is True
+    for source in AUTO_SOURCES:
+        saved = data.get(source)
+        if isinstance(saved, dict):
+            for key in AUTO_KEYS:
+                config[source][key] = clean_auto_value(key, saved.get(key))
+    return config
+
+
+def save_auto(config):
+    try:
+        AUTO_FILE.parent.mkdir(parents=True, exist_ok=True)
+        part = AUTO_FILE.with_suffix(".tmp")
+        part.write_text(json.dumps(config, indent=2))
+        part.replace(AUTO_FILE)
+    except OSError as err:
+        raise ActionError(f"Could not save {AUTO_FILE}: {err}")
+
+
+def power_source():
+    ac = on_ac()
+    return None if ac is None else ("ac" if ac else "battery")
+
+
+def apply_auto(source):
+    """Applies the saved settings for "ac" or "battery". Only changes what is different."""
+    entry = load_auto()[source]
+    title = AUTO_SOURCES[source]
+    steps = []
+
+    want = entry["profile"]
+    if want:
+        now = profile_info()
+        if now and want in now["options"] and now["active"] != want:
+            steps.append(lambda: set_profile(want))
+    rate = entry["refresh"]
+    if rate:
+        screen = display_info()
+        if screen and rate in screen["options"] and screen["active"] != rate:
+            steps.append(lambda: set_refresh(rate))
+    minutes = entry["idle"]
+    if minutes is not None:
+        idle = idle_info()
+        if idle is not None and idle["active"] != minutes:
+            steps.append(lambda: set_idle(minutes))
+    level = entry["brightness"]
+    light = backlight_info()
+    if level and light and round(light["value"] * 100 / light["max"]) != level:
+        steps.append(lambda: set_brightness(level))
+
+    done, failed = [], []
+    for step in steps:
+        try:
+            done.append(step())
+        except ActionError as err:
+            failed.append(str(err))
+    if failed:
+        raise ActionError(f"{title}: " + " ".join(failed))
+    return f"{title}: settings applied" if done else f"{title}: already set"
+
+
+def daemon_lock_path():
+    return Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "loq-center-auto.lock"
+
+
+def daemon_running():
+    try:
+        with open(daemon_lock_path(), "w") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        return False
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+
+
+def start_daemon():
+    """Starts the background watcher unless it is already running."""
+    if daemon_running():
+        return
+    try:
+        subprocess.Popen([sys.executable, os.path.realpath(sys.argv[0]), "--daemon"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+def _mtime(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0
+
+
+def ensure_session_env():
+    """A process started early may lack the variables hyprctl and hypridle need. Find them.
+
+    Returns True when a Hyprland session was found."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    os.environ["XDG_RUNTIME_DIR"] = runtime
+    base = Path(runtime)
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    if not signature or not (base / "hypr" / signature / ".socket.sock").exists():
+        found = sorted((base / "hypr").glob("*/.socket.sock"), key=_mtime)
+        if found:
+            os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = found[-1].parent.name
+        else:
+            os.environ.pop("HYPRLAND_INSTANCE_SIGNATURE", None)
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        sockets = sorted(p.name for p in base.glob("wayland-[0-9]") if p.is_socket())
+        if sockets:
+            os.environ["WAYLAND_DISPLAY"] = sockets[0]
+    return bool(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"))
+
+
+def run_daemon(stop=lambda: False, interval=3.0, wait=90.0):
+    """Applies the saved settings whenever the charger is plugged in or unplugged."""
+    last, pending = None, None
+    started = time.monotonic()
+    while not stop():
+        ready = ensure_session_env() or not have("hyprctl")
+        source = power_source()
+        if source is not None and source != last:
+            last, pending = source, source
+        if pending:
+            if not load_auto()["enabled"]:
+                pending = None
+            elif ready or time.monotonic() - started > wait:
+                try:
+                    print(apply_auto(pending), flush=True)
+                except ActionError as err:
+                    print(f"Auto switch: {err}", file=sys.stderr, flush=True)
+                pending = None
+        time.sleep(interval)
+    return 0
+
+
+def daemon_main():
+    try:
+        handle = open(daemon_lock_path(), "w")
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("The background service is already running.")
+        return 0
+    except OSError as err:
+        print(f"Cannot start the background service: {err}", file=sys.stderr)
+        return 1
+    try:
+        return run_daemon()
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        handle.close()
+
+
 # ------------------------------------------------------------------------ theme
 
 BASE_COLORS = {
@@ -1055,6 +1247,8 @@ class Window:
         self.meter = CpuMeter()
         self.fan_watcher = FanWatcher()
         self.theme_stamp = None
+        self.auto_last = None  # power source seen on the previous refresh
+        self.auto_options = {"profile": [], "refresh": [], "idle": False, "brightness": False}
         self.Choice = Choice
         self.ActionError = ActionError
         self.CONFIG_DIR = CONFIG_DIR
@@ -1088,6 +1282,7 @@ class Window:
         root.pack_start(self.stack, True, True, 0)
         self.build_dashboard()
         self.build_power()
+        self.build_auto()
         self.build_display()
         self.build_graphics()
         self.load_plugins()
@@ -1098,6 +1293,8 @@ class Window:
         self.refresh()
         self.refresh_gpu_mode()
         GLib.timeout_add_seconds(2, self.tick)
+        if load_auto()["enabled"]:
+            start_daemon()  # keeps switching after this window is closed
 
     # ---- widgets
     def vbox(self, spacing):
@@ -1203,6 +1400,108 @@ class Window:
         self.idle_note = self.add(self.idle_card, self.label("", "muted"))
         card = self.card(page, "Battery health")
         self.health = self.add(card, self.label("…"))
+
+    def build_auto(self):
+        page = self.page("auto", "Auto")
+        card = self.card(page, "Switch settings when the charger changes")
+        self.auto_enable = Choice(self, lambda v: self.pick_auto_enabled(v == "on"))
+        self.add(card, self.auto_enable.box)
+        self.auto_note = self.add(card, self.label("", "muted"))
+        self.auto_rows = {}
+        for source, title in AUTO_SOURCES.items():
+            card = self.card(page, title)
+            rows = {}
+            for key, heading in (("profile", "Performance mode"), ("refresh", "Refresh rate"),
+                                 ("idle", "Sleep timer"), ("brightness", "Brightness")):
+                box = self.vbox(4)
+                self.add(box, self.label(heading, "muted"))
+                row = Choice(self, lambda v, s=source, k=key: self.pick_auto(s, k, v))
+                self.add(box, row.box)
+                self.add(card, box)
+                rows[key] = (box, row)
+            self.auto_rows[source] = rows
+        card = self.card(page, "Try it")
+        self.add(card, self.button("Apply the settings for the current power source",
+                                   self.apply_auto_now))
+        self.add(card, self.label("Keep means that setting is left as it is.", "muted"))
+
+    def auto_view(self, config=None):
+        config = config or load_auto()
+        self.auto_enable.update([("on", "On"), ("off", "Off")], "on" if config["enabled"] else "off")
+        if not config["enabled"]:
+            self.auto_note.set_text("Off. Choose the settings below, then turn it on.")
+        elif daemon_running():
+            self.auto_note.set_text("On. A background service applies these settings when you plug in "
+                                    "or unplug the charger, even with this window closed.")
+        else:
+            self.auto_note.set_text("On, but the background service is not running yet. "
+                                    "It starts when you log in or open this window.")
+        options = self.auto_options
+        for source, rows in self.auto_rows.items():
+            entry = config[source]
+            profiles = [p for p in options["profile"] if not (source == "battery" and p == "max-power")]
+            choices = {
+                "profile": [(p, PROFILE_LABELS.get(p, p)) for p in profiles],
+                "refresh": [(r, f"{r} Hz") for r in options["refresh"]],
+                "idle": [(k, v[0]) for k, v in IDLE_PRESETS.items()] if options["idle"] else [],
+                "brightness": [(b, f"{b}%") for b in AUTO_BRIGHTNESS] if options["brightness"] else [],
+            }
+            for key, (box, row) in rows.items():
+                available = choices[key]
+                self.visible(box, bool(available))
+                if available:
+                    known = [value for value, _label in available]
+                    active = entry[key] if entry[key] in known else "keep"
+                    row.update([("keep", "Keep")] + available, active)
+
+    def pick_auto(self, source, key, value):
+        try:
+            config = load_auto()
+            config[source][key] = None if value == "keep" else value
+            save_auto(config)
+        except ActionError as err:
+            self.say(str(err), True)
+            return
+        self.auto_view(config)
+
+    def pick_auto_enabled(self, enabled):
+        try:
+            config = load_auto()
+            config["enabled"] = enabled
+            save_auto(config)
+        except ActionError as err:
+            self.say(str(err), True)
+            return
+        source = power_source()
+        if enabled:
+            start_daemon()
+        self.auto_view(config)
+        if enabled and source and not self.busy:
+            self.auto_last = source
+            self.act(lambda: apply_auto(source), "Applying settings…")
+        else:
+            self.say("Auto switch is on." if enabled else "Auto switch is off.")
+
+    def apply_auto_now(self):
+        source = power_source()
+        if source is None:
+            self.say("The power source is unknown.", True)
+            return
+        self.act(lambda: apply_auto(source), "Applying settings…")
+
+    def auto_check(self, data):
+        """Fallback while no background service runs: switch when this window sees a change."""
+        source = {True: "ac", False: "battery"}.get(data["ac"])
+        if source is None:
+            return
+        if self.auto_last is None:
+            self.auto_last = source
+            return
+        if source == self.auto_last or self.busy:
+            return
+        self.auto_last = source
+        if load_auto()["enabled"] and not daemon_running():
+            self.act(lambda: apply_auto(source), "Switching settings…")
 
     def build_display(self):
         page = self.page("display", "Display")
@@ -1524,6 +1823,15 @@ class Window:
                   "off": "switched off or not detected"}
         self.gpu_power.set_text(f"State: {states.get(data['nvidia'], data['nvidia'])}")
 
+        self.auto_options = {
+            "profile": profile["options"] if profile else [],
+            "refresh": list(screen["options"]) if screen and screen["options"] else [],
+            "idle": idle is not None,
+            "brightness": light is not None,
+        }
+        self.auto_view()
+        self.auto_check(data)
+
     def visible(self, widget, show):
         widget.set_no_show_all(not show)
         if show:
@@ -1570,8 +1878,10 @@ def main(argv):
         data["helper_installed"] = os.path.exists(HELPER)
         print(json.dumps(data, indent=2))
         return 0
+    if argv[1:] == ["--daemon"]:
+        return daemon_main()
     if argv[1:]:
-        print("Usage: loq-center [--status | --version]", file=sys.stderr)
+        print("Usage: loq-center [--status | --version | --daemon]", file=sys.stderr)
         return 2
     return start_gui()
 
@@ -2298,236 +2608,4 @@ def set_gpu(mode):
     if not Path(ENVYCONTROL).exists():
         raise Fail("envycontrol is not installed.")
     if mode == "integrated" and panel_on_nvidia():
-        raise Fail("Blocked: the built-in screen is wired to NVIDIA. Switch to Hybrid and reboot first.")
-    if mode == "integrated" and (safe_read(MUX_PENDING) == "dgpu" or mux_firmware()[1] == "dgpu"):
-        raise Fail("Blocked: dGPU only is selected for the next boot. Pick Hybrid and reboot first.")
-    for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGPIPE):
-        signal.signal(sig, signal.SIG_IGN)
-    done = envy("-s", mode, *GPU_MODES[mode])
-    output = f"{done.stdout}\n{done.stderr}"
-    errors = [line for line in output.splitlines() if "ERROR" in line]
-    now = envy("--query").stdout.strip()
-    if done.returncode != 0 or errors or now != mode:
-        detail = "\n".join(errors or output.strip().splitlines()[-8:])
-        raise Fail(f"GPU switch had a problem. Do not reboot until it is fixed.\n{detail}\n"
-                   "To go back: sudo envycontrol -s hybrid")
-    print(f"GPU mode set to {mode}. Reboot to apply.")
-
-
-def main(argv):
-    try:
-        match argv[1:]:
-            case ["set", "charge", mode]:
-                set_charge(mode)
-            case ["set", "profile", name]:
-                set_profile(name)
-            case ["set", "toggle", name, value]:
-                set_toggle(name, value)
-            case ["watch", "fans"]:
-                watch_fans()
-            case ["watch", "mux"]:
-                mux_report()
-            case ["gpu", "mux", mode]:
-                set_mux(mode)
-            case ["gpu", mode]:
-                set_gpu(mode)
-            case _:
-                print("Usage: set charge|profile|toggle ... | gpu integrated|hybrid | gpu mux dgpu|hybrid", file=sys.stderr)
-                return 2
-    except Fail as err:
-        print(err, file=sys.stderr)
-        return 3
-    except OSError as err:
-        print(f"System refused the change: {err}", file=sys.stderr)
-        return 4
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv))
-LOQ_FILE_LOQ_CENTER_HELPER
-
-cat > "$work/dev.loqcenter.policy" <<'LOQ_FILE_DEV_LOQCENTER_POLICY'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
- "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
-<policyconfig>
-  <action id="dev.loqcenter.set">
-    <description>Change LOQ battery, performance and device switches</description>
-    <message>Authentication is required to change laptop settings</message>
-    <defaults>
-      <allow_any>auth_admin</allow_any>
-      <allow_inactive>auth_admin</allow_inactive>
-      <allow_active>yes</allow_active>
-    </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/loq-center-helper</annotate>
-    <annotate key="org.freedesktop.policykit.exec.argv1">set</annotate>
-  </action>
-  <action id="dev.loqcenter.watch">
-    <description>Read LOQ fan speeds</description>
-    <message>Authentication is required to read the fan speeds</message>
-    <defaults>
-      <allow_any>auth_admin</allow_any>
-      <allow_inactive>auth_admin</allow_inactive>
-      <allow_active>yes</allow_active>
-    </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/loq-center-helper</annotate>
-    <annotate key="org.freedesktop.policykit.exec.argv1">watch</annotate>
-  </action>
-  <action id="dev.loqcenter.gpu">
-    <description>Switch LOQ graphics mode</description>
-    <message>Authentication is required to switch the graphics mode</message>
-    <defaults>
-      <allow_any>auth_admin</allow_any>
-      <allow_inactive>auth_admin</allow_inactive>
-      <allow_active>auth_admin</allow_active>
-    </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/loq-center-helper</annotate>
-    <annotate key="org.freedesktop.policykit.exec.argv1">gpu</annotate>
-  </action>
-</policyconfig>
-LOQ_FILE_DEV_LOQCENTER_POLICY
-
-cat > "$work/loq-center.dcol" <<'LOQ_FILE_LOQ_CENTER_DCOL'
-$HOME/.config/loq-center/theme.css
-@define-color loq_bg #<wallbash_pry1>;
-@define-color loq_surface #<wallbash_1xa2>;
-@define-color loq_border #<wallbash_1xa4>;
-@define-color loq_fg #<wallbash_txt1>;
-@define-color loq_muted #<wallbash_1xa8>;
-@define-color loq_accent #<wallbash_4xa7>;
-@define-color loq_accent2 #<wallbash_3xa8>;
-@define-color loq_on_accent #<wallbash_pry1>;
-LOQ_FILE_LOQ_CENTER_DCOL
-
-say "Checking the files"
-/usr/bin/python3 -I -c 'import sys
-for f in sys.argv[1:]: compile(open(f, encoding="utf-8").read(), f, "exec")' \
-  "$work/loq-center" "$work/loq-center-helper" || die "A file is damaged. Download the installer again."
-/usr/bin/python3 -c 'import gi; gi.require_version("Gtk", "3.0"); from gi.repository import Gtk' \
-  >/dev/null 2>&1 || die "Python GTK3 does not load. Install python-gobject/gtk3 (or python3-gi) and try again."
-
-say "Installing the app (sudo is needed for the root helper)"
-sudo install -Dm755 -o root -g root "$work/loq-center-helper" "$HELPER"
-sudo install -Dm644 -o root -g root "$work/dev.loqcenter.policy" "$POLICY"
-install -Dm755 "$work/loq-center" "$BIN/loq-center"
-
-# Download the icon. If GitHub cannot be reached the app still works with a stock icon.
-fetch() {
-  if command -v curl >/dev/null; then
-    curl -fsL --connect-timeout 10 --max-time 30 -o "$2" "$1"
-  elif command -v wget >/dev/null; then
-    wget -q -T 30 -O "$2" "$1"
-  else
-    return 1
-  fi
-}
-
-icon_ref="computer-laptop"
-install_icon() {
-  local tmp="$work/$ICON_FILE" url got=0 urls=()
-  if [ -n "${LOQ_ICON_URL:-}" ]; then
-    urls=("$LOQ_ICON_URL")
-  else
-    urls=("$ICON_BASE/main/icon/$ICON_FILE" "$ICON_BASE/master/icon/$ICON_FILE")
-  fi
-  for url in "${urls[@]}"; do
-    if fetch "$url" "$tmp" && [ -s "$tmp" ] && grep -q '<svg' "$tmp"; then
-      got=1
-      break
-    fi
-  done
-  if [ "$got" -eq 1 ]; then
-    install -Dm644 "$tmp" "$ICON"
-    refresh_icons
-    icon_ref="loq-center"
-    say "Icon installed"
-  elif [ -f "$ICON" ]; then
-    icon_ref="loq-center"
-    say "Could not download the icon, so the one already installed was kept."
-  else
-    say "Could not download the icon from GitHub, so a stock icon is used. Run the installer again once the icon is uploaded."
-  fi
-}
-install_icon
-
-mkdir -p "$(dirname "$DESKTOP")" "$CONFIG/loq-center"
-cat > "$DESKTOP" <<DESKTOP_EOF
-[Desktop Entry]
-Type=Application
-Name=LOQ Center
-Comment=Battery, performance, display and GPU controls
-Exec="$BIN/loq-center"
-Icon=$icon_ref
-Terminal=false
-Categories=Settings;HardwareSettings;
-StartupWMClass=loq-center
-DESKTOP_EOF
-
-if [ -d "$CONFIG/hyde" ]; then
-  say "Adding the HyDE wallbash theme"
-  install -Dm644 "$work/loq-center.dcol" "$DCOL"
-  if command -v hyde-shell >/dev/null; then
-    hyde-shell reload >/dev/null 2>&1 || say "Change your wallpaper once to apply the colours."
-  else
-    say "Change your wallpaper once to apply the colours."
-  fi
-else
-  say "HyDE config folder not found; the built-in colours will be used."
-fi
-
-key_taken() {
-  command -v hyprctl >/dev/null || return 1
-  hyprctl -j binds 2>/dev/null | /usr/bin/python3 -I -c 'import json, sys
-try: binds = json.load(sys.stdin)
-except ValueError: sys.exit(1)
-hit = any(b.get("modmask") == 65 and str(b.get("key", "")).upper() == "L"
-          and "LOQ Center" not in str(b.get("description", ""))
-          and "loq-center" not in str(b.get("arg", "")) for b in binds)
-sys.exit(0 if hit else 1)'
-}
-
-remove_hooks
-bind_key=1
-if key_taken; then
-  bind_key=0
-  say "SUPER+SHIFT+L is already in use, so no shortcut was added."
-fi
-
-if [ -f "$LUA_MAIN" ] && [ -f "$DATA/hypr/hyde.lua" ]; then
-  if grep -qE '^return([^A-Za-z0-9_]|$)' "$LUA_MAIN"; then
-    say "hyprland.lua ends with 'return', so it was not edited. Open LOQ Center from the app launcher."
-  else
-    cp "$LUA_MAIN" "$LUA_MAIN.before-loq-center"
-    {
-      if [ "$bind_key" -eq 1 ]; then
-        echo 'hl.bind("SUPER + SHIFT + L", hl.dsp.exec_cmd(os.getenv("HOME") .. "/.local/bin/loq-center"), { description = "[Utilities] LOQ Center" })'
-      fi
-      echo 'hl.window_rule({ name = "loq-center", match = { class = "^(loq-center|dev[.]loqcenter[.]App)$" }, float = true, center = true })'
-    } > "$LUA_OWN"
-    [ -z "$(tail -c1 "$LUA_MAIN")" ] || echo >> "$LUA_MAIN"
-    {
-      echo "$BEGIN"
-      echo "pcall(dofile, [[$LUA_OWN]])"
-      echo "$END"
-    } >> "$LUA_MAIN"
-    reload_hypr
-    say "Hyprland rule added (backup: $LUA_MAIN.before-loq-center)"
-  fi
-elif [ -f "$CONF" ] && [ ! -f "$DATA/hypr/hyde.lua" ]; then
-  if [ "$bind_key" -eq 1 ]; then
-    [ -z "$(tail -c1 "$CONF")" ] || echo >> "$CONF"
-    echo 'bind = SUPER SHIFT, L, exec, $HOME/.local/bin/loq-center # loq-center' >> "$CONF"
-    reload_hypr
-    say "Shortcut added to userprefs.conf"
-  fi
-else
-  say "No HyDE config recognised. Open LOQ Center from the app launcher."
-fi
-
-say "Done."
-say "Open with SUPER+SHIFT+L (if added) or run: ~/.local/bin/loq-center"
-if pgrep -u "$(id -u)" -f "$BIN/loq-center" >/dev/null 2>&1; then
-  say "Close the currently open LOQ Center window and reopen it to apply the update."
-fi
-command -v envycontrol >/dev/null || say "The Integrated button stays hidden: envycontrol is not installed (optional)."
+        raise Fail("Blocked: the built-in screen is wired to NVIDIA. Switch to Hybrid and rebo
