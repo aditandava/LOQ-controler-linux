@@ -19,10 +19,11 @@ Everything in the window is detected at runtime. A control appears only when you
 | `src/dev.loqcenter.policy` | The Polkit policy for the helper. |
 | `src/loq-center.dcol` | The HyDE wallbash colour template. |
 | `icon/loq-center.svg` | The app icon. |
+| `LICENSE` | GNU General Public License, version 3. |
 
 The installer downloads everything in `src/` and `icon/` from this repository, or uses the copies next to it when you cloned the repository. Keep the folders in place and keep every file under 100 KB.
 
-LOQ Center loads every plugin in `~/.config/loq-center/plugins/*.py`. Without `loq_rgb.sh` you get the four core tabs. Edit `loq_rgb.sh` and run it again, and the RGB tab updates without touching the main installer.
+LOQ Center loads every plugin in `~/.config/loq-center/plugins/*.py`. Without `loq_rgb.sh` you get the four core tabs. Edit `loq_rgb.sh` and run it again, and the RGB tab updates without touching the main installer. Plugins run as your user inside the app, so only put files there that you trust.
 
 ---
 
@@ -31,12 +32,14 @@ LOQ Center loads every plugin in `~/.config/loq-center/plugins/*.py`. Without `l
 ### Dashboard
 - CPU temperature, CPU load, memory, battery %, battery power draw and fan speed.
 - **Animated fans**: one small fan per fan. The faster the fan runs, the faster its blades turn, and the blades slow down and stop when the fan stops. The motion shows the speed level, not the real RPM, which is too fast to draw. It only moves while the Dashboard tab is open.
-- One-click presets: **Battery saver**, **Daily**, **Performance**. Each sets the performance mode, the screen refresh rate and the brightness together.
+- One-click presets: **Ultra saver**, **Battery saver**, **Daily**, **Performance**. Each sets the performance mode, the screen refresh rate and the brightness together.
+  - **Ultra saver** also uses the lowest refresh rate and 20% brightness, turns the keyboard light off and sets the sleep timer to 5 minutes.
 
 ### Power
-- **Performance mode**: Quiet, Balanced, Performance, Max power and Cooling. Uses the kernel platform profile (modern `/sys/class/platform-profile/` and the older ACPI file), with `powerprofilesctl` as a fallback. `Fn+Q` stays in sync.
+- **Performance mode**: Quiet, Balanced, Performance, Max power, Cooling and Ultra saver. Uses the kernel platform profile (modern `/sys/class/platform-profile/` and the older ACPI file), with `powerprofilesctl` as a fallback. `Fn+Q` stays in sync.
 - **Max power**: the firmware's own Extreme mode when it exists, otherwise Custom mode with the firmware power limits at maximum. The charger must be plugged in.
 - **Cooling**: Custom mode with the lowest firmware power limits, capped CPU and integrated-GPU clocks, the NVIDIA clock locked low while the GPU is awake, and the fans at full speed. Full fan speed goes through `legion_laptop`, `acpi_call` or the `lenovo_wmi_other` driver, whichever works. Your previous limits are restored when you pick another mode.
+- **Ultra saver**: Quiet mode with CPU turbo off and the CPU held at about half speed. It leaves the NVIDIA GPU and the fans alone, so a sleeping GPU stays asleep. Your previous CPU settings are restored when you pick another mode.
 - **Battery charging**: Battery care (firmware charge limit), Full charge, Rapid charge.
 - **Sleep and idle timer**: `hypridle` presets of 5 min, 10 min, 30 min or Never (dim, lock, screen off, sleep).
 - **Battery health**: remaining capacity compared with new, and charge cycles.
@@ -60,7 +63,7 @@ Choose one set of settings for **On charger** and another for **On battery**. LO
 - NVIDIA power state, read from sysfs so a sleeping GPU stays asleep. GPU sensors are read only when you press the button.
 - GPU mode, applied after a reboot:
   - **Integrated** and **Hybrid** through `envycontrol`.
-  - **dGPU only** through the firmware MUX switch. This is new and not yet tested on real hardware, and the app warns you before it runs.
+  - **dGPU only** through the firmware MUX switch. This is new and not yet tested on real hardware, and the app warns you before it runs. If the screen stays black, you can change the setting back in the BIOS (F2 at startup, Graphics Device).
 
 ### LOQ RGB (needs `loq_rgb.sh`)
 - Controls 4-zone ITE keyboards (vendor `048d`, product IDs `c995`, `c994`, `c993`, `c985`, `c984`, `c983`, `c975`, `c973`, `c965`, `c963`, `c955`) through `/dev/hidraw*`, with a PyUSB fallback.
@@ -107,6 +110,8 @@ Uninstall the same way, adding `--uninstall` inside the command: `bash <(curl -f
 Close and reopen LOQ Center to see the **LOQ RGB** tab.
 
 The installer needs internet access to fetch the icon. If the download fails, the app still works with a stock icon, and running the installer again fixes it.
+
+To update, run the installer again. If the RGB tab cannot reach the keyboard afterwards, unplug and replug it, or log out and back in.
 
 ---
 
@@ -185,6 +190,23 @@ python3 ~/.config/loq-center/plugins/rgb.py --apply
 
 ---
 
+## Permissions and safety
+
+LOQ Center changes hardware settings through a small root helper that runs with Polkit. The helper only accepts a fixed list of actions.
+
+- Power mode, charging, Fn lock and camera changes do not ask for a password.
+- Switching the GPU mode always asks for your administrator password, because a wrong change can leave you with a black screen.
+- The RGB udev rules give access to the keyboard only to the user who is logged in at the machine.
+- Only one change runs at a time, so the window and the Auto watcher cannot clash.
+
+---
+
+## Logs and troubleshooting
+
+Errors from the helper, plugins and the Auto watcher are written to `~/.cache/loq-center/log`. The file is trimmed when it grows past 200 KB. Please include its last lines, and the output of `~/.local/bin/loq-center --status`, when you report a problem.
+
+---
+
 ## Other keyboards
 
 If your keyboard's product ID is not in the list, edit the rules in `loq_rgb.sh` (or uncomment the generic `048d` lines) and run `bash loq_rgb.sh` again.
@@ -206,3 +228,9 @@ bash loq_controller_install.sh --uninstall
 ```
 
 Your battery and performance settings stay as you last set them.
+
+---
+
+## License
+
+GPL-3.0-or-later. See the [LICENSE](LICENSE) file.
