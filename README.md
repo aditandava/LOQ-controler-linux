@@ -14,7 +14,13 @@ Everything in the window is detected at runtime. A control appears only when you
 | :--- | :--- |
 | `loq_controller_install.sh` | Installs LOQ Center (Dashboard, Power, Display, Graphics tabs), the root helper, the Polkit policy, the app icon, the desktop entry and the HyDE/Hyprland integration. Contains no RGB code. |
 | `loq_rgb.sh` | Optional. Adds the **LOQ RGB** tab as a plugin, plus the udev rules and PyUSB for the keyboard. Run it after the main installer. |
-| `icon/loq-center.svg` | The app icon. The installer downloads it from this folder. |
+| `src/loq-center` | The LOQ Center app (Python and GTK). |
+| `src/loq-center-helper` | The small root helper that changes the hardware settings, run through Polkit. |
+| `src/dev.loqcenter.policy` | The Polkit policy for the helper. |
+| `src/loq-center.dcol` | The HyDE wallbash colour template. |
+| `icon/loq-center.svg` | The app icon. |
+
+The installer downloads everything in `src/` and `icon/` from this repository, or uses the copies next to it when you cloned the repository. Keep the folders in place and keep every file under 100 KB.
 
 LOQ Center loads every plugin in `~/.config/loq-center/plugins/*.py`. Without `loq_rgb.sh` you get the four core tabs. Edit `loq_rgb.sh` and run it again, and the RGB tab updates without touching the main installer.
 
@@ -24,6 +30,7 @@ LOQ Center loads every plugin in `~/.config/loq-center/plugins/*.py`. Without `l
 
 ### Dashboard
 - CPU temperature, CPU load, memory, battery %, battery power draw and fan speed.
+- **Animated fans**: one small fan per fan. The faster the fan runs, the faster its blades turn, and the blades slow down and stop when the fan stops. The motion shows the speed level, not the real RPM, which is too fast to draw. It only moves while the Dashboard tab is open.
 - One-click presets: **Battery saver**, **Daily**, **Performance**. Each sets the performance mode, the screen refresh rate and the brightness together.
 
 ### Power
@@ -33,6 +40,16 @@ LOQ Center loads every plugin in `~/.config/loq-center/plugins/*.py`. Without `l
 - **Battery charging**: Battery care (firmware charge limit), Full charge, Rapid charge.
 - **Sleep and idle timer**: `hypridle` presets of 5 min, 10 min, 30 min or Never (dim, lock, screen off, sleep).
 - **Battery health**: remaining capacity compared with new, and charge cycles.
+
+### Auto (charger plugged in or on battery)
+Choose one set of settings for **On charger** and another for **On battery**. LOQ Center applies them by itself when you plug in or unplug the charger.
+
+- Per power source you can set the performance mode, the refresh rate, the sleep timer and the screen brightness. **Keep** leaves a setting alone.
+- Max power is not offered for battery, because it needs the charger.
+- A small background service does the switching, so it works with the window closed. It starts when you log in or when you turn Auto on, and it does nothing while Auto is off.
+- It acts only when the power source changes. Your own changes in between are never overridden.
+- The **Apply** button in the tab tries the current power source straight away.
+- Settings are saved in `~/.config/loq-center/auto.json`.
 
 ### Display
 - Refresh rate of the built-in screen through `hyprctl`. It resets when Hyprland reloads.
@@ -101,6 +118,7 @@ This is built in. You do not set anything up.
 - **HyDE Sync button** (RGB tab): copies four accent colours from your current HyDE theme to the keyboard zones.
 - **Hyprland shortcut**: `SUPER + SHIFT + L` opens LOQ Center, added only if the key is free.
 - **Floating window**: on HyDE setups that use `hyprland.lua`, a window rule opens it centred and floating (a backup of your config is kept).
+- **Login start**: the Auto watcher is started by Hyprland at login.
 - **Display tab**: refresh rate switching uses `hyprctl`.
 - **Sleep and idle timer**: edits your `hypridle` config.
 
@@ -150,6 +168,13 @@ Installed automatically on Arch / EndeavourOS (`pacman`), Debian / Ubuntu (`apt`
 ~/.local/bin/loq-center             # open the window
 ~/.local/bin/loq-center --status    # print detected hardware as JSON
 ~/.local/bin/loq-center --version
+~/.local/bin/loq-center --daemon    # the Auto watcher (started for you)
+```
+
+Check that the Auto watcher is running after a login:
+
+```bash
+pgrep -af 'loq-center --daemon'
 ```
 
 - **Apply the last RGB profile from a script**:
