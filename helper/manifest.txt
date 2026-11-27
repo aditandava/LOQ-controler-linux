@@ -1,0 +1,12 @@
+# Root helper (runs through pkexec) -> src/loq-center-helper
+# One part file per line, joined in this order by tools/build.py.
+00_header.py
+10_core.py
+20_hardware_nodes.py
+30_charge.py
+40_acpi_fans.py
+50_power_limits.py
+60_cooling.py
+70_profiles_toggles.py
+80_gpu_mux.py
+90_main.py

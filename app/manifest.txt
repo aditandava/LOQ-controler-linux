@@ -1,0 +1,31 @@
+# LOQ Center app -> src/loq-center
+# One part file per line, joined in this order by tools/build.py.
+core/00_header.py
+core/10_constants.py
+core/20_helpers.py
+features/battery.py
+features/idle_timer.py
+features/performance.py
+features/toggles.py
+features/brightness.py
+features/display.py
+features/graphics.py
+features/sensors.py
+features/presets.py
+features/smart_switch.py
+ui/theme.py
+@generated:wallpapers
+ui/background.py
+ui/start_gui.py
+ui/controls.py
+ui/fan_wheel.py
+ui/window/widgets.py
+ui/window/actions.py
+ui/window/dashboard.py
+ui/window/power.py
+ui/window/smart_switch.py
+ui/window/display.py
+ui/window/graphics.py
+ui/window/refresh.py
+ui/window/window.py
+core/90_main.py

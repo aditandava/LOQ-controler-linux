@@ -1,0 +1,12 @@
+# LOQ RGB plugin -> plugins/rgb/rgb.py (installed as ~/.config/loq-center/plugins/rgb.py)
+# One part file per line, joined in this order by tools/build.py.
+00_header_imports.py
+10_constants.py
+20_state.py
+30_device_discovery.py
+35_colors.py
+40_protocol.py
+50_transport.py
+60_hyde_sync.py
+70_rgb_tab.py
+90_register.py

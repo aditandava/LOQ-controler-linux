@@ -1,0 +1,10 @@
+# Installer -> loq_controller_install.sh
+# One part file per line, joined in this order by tools/build.py.
+00_header_vars.sh
+10_helpers.sh
+20_uninstall.sh
+30_dependencies.sh
+40_install_app.sh
+50_hyde_theme.sh
+60_hyprland_hooks.sh
+70_finish.sh
