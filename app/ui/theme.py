@@ -36,6 +36,20 @@ window.loq button.active, window.loq button:checked {
 window.loq button.active label, window.loq button:checked label { color: @loq_on_accent;
   font-weight: bold; }
 window.loq button:disabled { opacity: 0.55; }
+window.loq button.pill-toggle {
+  border-radius: 999px; padding: 8px 18px; min-width: 118px; font-weight: bold;
+  background-color: alpha(@loq_bg, 0.72); border: 1px solid alpha(@loq_fg, 0.16);
+  box-shadow: inset 0 1px 2px alpha(black, 0.25);
+  transition: all 180ms ease; }
+window.loq button.pill-toggle:hover {
+  border-color: @loq_accent; background-color: alpha(@loq_surface, 0.88); }
+window.loq button.pill-toggle.active, window.loq button.pill-toggle:checked {
+  background-color: @loq_accent;
+  background-image: linear-gradient(135deg, @loq_accent, @loq_accent2);
+  border-color: transparent;
+  box-shadow: 0 3px 12px alpha(@loq_accent, 0.35); }
+window.loq button.pill-toggle.active label, window.loq button.pill-toggle:checked label {
+  color: @loq_on_accent; font-weight: 800; }
 window.loq progressbar trough { background-image: none; background-color: alpha(@loq_bg, 0.65);
   border: none; border-radius: 999px; min-height: 8px; }
 window.loq progressbar progress { background-image: linear-gradient(to right, @loq_accent, @loq_accent2);
@@ -97,5 +111,3 @@ def build_css(theme_text, picture=None, scenes=None):
                 "background-size: cover; background-position: center bottom; "
                 "background-repeat: no-repeat; }\n")
     return css
-
-
