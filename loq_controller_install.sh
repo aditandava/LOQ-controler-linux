@@ -156,6 +156,7 @@ or a tool on this machine really provides it.
 import fcntl
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -165,7 +166,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "1.9"
+VERSION = "1.10"
 SYS = Path("/sys")
 PROC = Path("/proc")
 HELPER = "/usr/local/libexec/loq-center-helper"
@@ -1237,6 +1238,94 @@ class Choice:
                 context.remove_class("active")
 
 
+def spin_rate(rpm):
+    """Turns per second shown on screen for a fan speed. A stopped fan does not turn.
+
+    The real speed is far too fast to draw, so this only has to look faster when the fan is
+    faster. It is capped so the blades never seem to turn backwards on screen."""
+    if not rpm or rpm <= 0:
+        return 0.0
+    return min(2.4, 0.25 + rpm / 2600.0)
+
+
+def draw_fan(cr, width, height, angle, colors, active=True, blades=5):
+    """Draws a small fan with its blades turned by `angle` radians."""
+    cx, cy = width / 2, height / 2
+    radius = min(width, height) / 2 - 2
+    cr.set_line_width(2)
+    cr.set_source_rgba(*colors["ring"])
+    cr.new_path()
+    cr.arc(cx, cy, radius, 0, 2 * math.pi)
+    cr.stroke()
+    blade = colors["blade"] if active else (*colors["idle"][:3], 0.45)
+    cr.save()
+    cr.translate(cx, cy)
+    cr.rotate(angle)
+    for _ in range(blades):
+        cr.new_path()
+        cr.move_to(radius * 0.16, -radius * 0.04)
+        cr.curve_to(radius * 0.28, -radius * 0.70, radius * 0.80, -radius * 0.62,
+                    radius * 0.90, -radius * 0.14)
+        cr.curve_to(radius * 0.62, -radius * 0.02, radius * 0.40, radius * 0.10,
+                    radius * 0.16, radius * 0.08)
+        cr.close_path()
+        cr.set_source_rgba(*blade)
+        cr.fill()
+        cr.rotate(2 * math.pi / blades)
+    cr.restore()
+    cr.new_path()
+    cr.set_source_rgba(*(colors["hub"] if active else (*colors["idle"][:3], 0.6)))
+    cr.arc(cx, cy, radius * 0.17, 0, 2 * math.pi)
+    cr.fill()
+
+
+class FanWheel:
+    """A small fan on the Dashboard. It turns faster when the fan really runs faster."""
+
+    def __init__(self, ui, size=60):
+        self.ui = ui
+        self.area = ui.Gtk.DrawingArea()
+        self.area.set_size_request(size, size)
+        self.area.connect("draw", self.on_draw)
+        self.angle = 0.0
+        self.speed = 0.0   # turns per second drawn right now; eases towards the target
+        self.target = 0.0
+        self.rpm = None    # None: no reading
+
+    def set_rpm(self, rpm):
+        changed = (rpm is None) != (self.rpm is None)
+        self.rpm = rpm
+        self.target = spin_rate(rpm)
+        if changed:
+            self.area.queue_draw()
+
+    def step(self, dt):
+        """Moves the blades for dt seconds. Speeding up and slowing down is gradual."""
+        self.speed += (self.target - self.speed) * min(1.0, dt * 3.0)
+        if abs(self.speed - self.target) < 0.01:
+            self.speed = self.target
+        if self.speed <= 0:
+            return False
+        self.angle = (self.angle + self.speed * 2 * math.pi * dt) % (2 * math.pi)
+        self.area.queue_draw()
+        return True
+
+    def on_draw(self, area, cr):
+        context = area.get_style_context()
+
+        def pick(name, fallback):
+            found, color = context.lookup_color(name)
+            return (color.red, color.green, color.blue, 1.0) if found else fallback
+
+        colors = {"ring": pick("loq_border", (0.27, 0.28, 0.35, 1.0)),
+                  "blade": pick("loq_accent", (0.78, 0.61, 0.94, 1.0)),
+                  "hub": pick("loq_accent2", (0.92, 0.74, 0.73, 1.0)),
+                  "idle": pick("loq_muted", (0.70, 0.72, 0.82, 1.0))}
+        draw_fan(cr, area.get_allocated_width(), area.get_allocated_height(),
+                 self.angle, colors, self.rpm is not None)
+        return False
+
+
 class Window:
     def __init__(self, app, Gtk, Gdk, GLib):
         self.Gtk, self.Gdk, self.GLib = Gtk, Gdk, GLib
@@ -1247,6 +1336,8 @@ class Window:
         self.meter = CpuMeter()
         self.fan_watcher = FanWatcher()
         self.theme_stamp = None
+        self.fan_wheels = []
+        self.spin_last = time.monotonic()
         self.auto_last = None  # power source seen on the previous refresh
         self.auto_options = {"profile": [], "refresh": [], "idle": False, "brightness": False}
         self.Choice = Choice
@@ -1293,6 +1384,7 @@ class Window:
         self.refresh()
         self.refresh_gpu_mode()
         GLib.timeout_add_seconds(2, self.tick)
+        GLib.timeout_add(33, self.spin)
         if load_auto()["enabled"]:
             start_daemon()  # keeps switching after this window is closed
 
@@ -1374,6 +1466,13 @@ class Window:
             bar = None
             if key in ("cpu_temp", "cpu_use", "memory", "battery"):
                 bar = self.add(box, self.Gtk.ProgressBar())
+            if key == "fans":
+                wheels = self.Gtk.Box(spacing=10)
+                for _ in range(2):
+                    wheel = FanWheel(self)
+                    wheels.pack_start(wheel.area, False, False, 0)
+                    self.fan_wheels.append(wheel)
+                self.add(box, wheels)
             self.stats[key] = (value, bar)
             grid.attach(box, index % 3, index // 3, 1, 1)
         card = self.card(page, "One-click presets")
@@ -1703,6 +1802,16 @@ class Window:
         self.background(graphics_state, done)
 
     # ---- refresh
+    def spin(self):
+        """Turns the Dashboard fans. Does nothing while another tab is showing."""
+        now = time.monotonic()
+        dt = min(now - self.spin_last, 0.25)
+        self.spin_last = now
+        if self.stack.get_visible_child_name() == "dashboard" and self.window.is_visible():
+            for wheel in self.fan_wheels:
+                wheel.step(dt)
+        return True
+
     def tick(self):
         self.load_theme()
         self.refresh()
@@ -1743,6 +1852,10 @@ class Window:
         watts = battery["watts"] if battery else None
         self.stat("watts", "n/a" if watts is None else f"{watts:.1f} W")
         self.stat("fans", "  ".join(f"{v}" for v in data["fans"]) + " RPM" if data["fans"] else "n/a")
+        fans = data["fans"]
+        for index, wheel in enumerate(self.fan_wheels):
+            wheel.set_rpm(fans[index] if index < len(fans) else None)
+            self.visible(wheel.area, index < max(1, len(fans)))
 
         source = {True: "On charger", False: "On battery", None: "Power source unknown"}[data["ac"]]
         status = f" · {battery['status']}" if battery else ""
@@ -2512,100 +2625,4 @@ def envy(*args):
 
 
 def panel_mode():
-    """Which GPU drives the built-in screen right now: "hybrid", "dgpu" or None."""
-    drm = SYS / "class/drm"
-    vendors = set()
-    for connector in drm.glob("card*-eDP-*"):
-        if safe_read(connector / "status") == "connected":
-            vendors.add(safe_read(drm / connector.name.split("-")[0] / "device/vendor"))
-    return {("0x10de",): "dgpu", ("0x8086",): "hybrid"}.get(tuple(vendors))
-
-
-def mux_read(method, method_id):
-    reply = acpi_call(f"{method} 0x0 0x{method_id:02x} b00000000")
-    return int(reply, 16) if reply in ("0x0", "0x1") else None
-
-
-def mux_firmware():
-    """(method path, "hybrid" or "dgpu") when the firmware reports a switchable MUX."""
-    method = wmi_method(GAMEZONE_GUID)
-    if method is None or mux_read(method, MUX_SUPPORTED) != 1:
-        return None, None
-    value = mux_read(method, MUX_GET)
-    return method, next((name for name, number in MUX_MODES.items() if number == value), None)
-
-
-def dgpu_blocker():
-    """Why dGPU only could leave a black screen right now, or None."""
-    if on_battery():
-        return "Plug in the charger first."
-    if safe_read(SYS / "module/nvidia_drm/parameters/modeset") != "Y":
-        return ("The NVIDIA display driver is not ready (nvidia_drm modeset is not on). "
-                "The screen could stay black.")
-    words = (safe_read(CMDLINE) or "").split()
-    if "nomodeset" in words:
-        return "The kernel option nomodeset is set. Remove it and reboot first."
-    if Path(ENVYCONTROL).exists() and envy("--query").stdout.strip() == "integrated":
-        return "NVIDIA is set to Integrated (off). Switch to Hybrid, reboot, then try again."
-    return None
-
-
-def mux_report():
-    """Read-only check for the terminal. Changes nothing."""
-    method, firmware = mux_firmware()
-    print(json.dumps({"supported": method is not None, "firmware": firmware,
-                      "screen": panel_mode(), "pending": safe_read(MUX_PENDING),
-                      "dgpu_check": dgpu_blocker() or "ok"}))
-
-
-def set_mux(mode):
-    if mode not in MUX_MODES:
-        raise Fail("Unknown display mode.")
-    method, firmware = mux_firmware()
-    if method is None:
-        raise Fail("The firmware did not report a switchable display (check that acpi_call "
-                   f"is loaded). Nothing was changed. {BIOS_HINT}")
-    screen = panel_mode()
-    if firmware is None or screen is None:
-        raise Fail(f"Could not read the current display mode. Nothing was changed. {BIOS_HINT}")
-    pending = safe_read(MUX_PENDING)
-    if pending is None and firmware != screen:
-        # Either a change is waiting for a reboot, or this model answers differently
-        raise Fail(f"The firmware says {MUX_LABELS[firmware]} but the screen is on "
-                   f"{MUX_LABELS[screen]}. Nothing was changed. Reboot first. {BIOS_HINT}")
-    if mode == "dgpu":
-        blocker = dgpu_blocker()
-        if blocker:
-            raise Fail(f"{blocker} Nothing was changed.")
-    if pending is None and mode == screen:
-        print(f"Already in {MUX_LABELS[mode]}.")
-        return
-    for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGPIPE):
-        signal.signal(sig, signal.SIG_IGN)
-    # Remember the request first, so a half finished switch still blocks Integrated
-    MUX_PENDING.write_text(mode + "\n")
-    MUX_PENDING.chmod(0o644)
-    reply = acpi_call(f"{method} 0x0 0x{MUX_SET:02x} b{MUX_MODES[mode]:02x}000000")
-    after = mux_read(method, MUX_GET)
-    if reply is not None and reply.startswith("Error"):
-        if pending:
-            MUX_PENDING.write_text(pending + "\n")
-        elif after == MUX_MODES[screen]:
-            MUX_PENDING.unlink(missing_ok=True)
-        raise Fail(f"The firmware refused the switch. {BIOS_HINT}")
-    if mode == screen and after == MUX_MODES[mode]:
-        MUX_PENDING.unlink(missing_ok=True)
-        print(f"Change cancelled. The screen stays on {MUX_LABELS[mode]}.")
-        return
-    proof = ("The firmware confirms it." if after == MUX_MODES[mode]
-             else "The firmware has not confirmed it yet; check again after reboot.")
-    print(f"{MUX_LABELS[mode]} requested. {proof} Reboot to apply.")
-
-
-def set_gpu(mode):
-    if mode not in GPU_MODES:
-        raise Fail("Unknown GPU mode.")
-    if not Path(ENVYCONTROL).exists():
-        raise Fail("envycontrol is not installed.")
-    if mode == "integrated" and panel_on_nvidia():
-        raise Fail("Blocked: the built-in screen is wired to NVIDIA. Switch to Hybrid and rebo
+    """Which GPU drives the built-in screen right now: "hybrid", "dgpu" or Non
