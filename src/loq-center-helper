@@ -1,0 +1,851 @@
+#!/usr/bin/python3 -I
+# Copyright (C) 2026 aditandava
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""Root helper for LOQ Center, run through pkexec. Only whitelisted actions exist."""
+import contextlib
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SYS = Path("/sys")
+COOLING_STATE = Path("/run/loq-center-cooling.json")
+ENVYCONTROL = "/usr/bin/envycontrol"
+CHARGE_MODES = ("Standard", "Long_Life", "Fast")
+TOGGLES = ("fn_lock", "camera_power")
+GPU_MODES = {"integrated": [], "hybrid": ["--rtd3", "2"]}
+CMDLINE = Path("/proc/cmdline")
+HELPER_LOCK = Path("/run/loq-center-helper.lock")  # one change at a time
+HEAVY_PROFILES = ("cooling", "max-power", "ultra-saver")  # only reachable through the "power" action
+MUX_PENDING = Path("/run/loq-center-mux")  # emptied by every reboot
+GAMEZONE_GUID = "887B54E3-DDDC-4B2C-8B88-68A26A8835D0"
+MUX_SUPPORTED, MUX_GET, MUX_SET = 0x28, 0x29, 0x2A  # GameZone "GSync" methods
+MUX_MODES = {"hybrid": 0, "dgpu": 1}
+MUX_LABELS = {"hybrid": "Hybrid", "dgpu": "dGPU only"}
+BIOS_HINT = "You can still change it in the BIOS (F2 at startup, Graphics Device)."
+PPD_NAMES = {"low-power": "power-saver", "balanced": "balanced", "performance": "performance"}
+CLEAN_ENV = {"PATH": "/usr/bin:/usr/sbin:/bin:/sbin", "LANG": "C.UTF-8"}
+
+
+class Fail(Exception):
+    pass
+
+
+@contextlib.contextmanager
+def exclusive(timeout=30):
+    """Only one changing action runs at a time (GUI and the Auto watcher can overlap)."""
+    with open(HELPER_LOCK, "a") as handle:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise Fail("Another LOQ Center change is still running. Try again in a moment.")
+                time.sleep(0.2)
+        yield
+
+
+def read(path):
+    return path.read_text().strip()
+
+
+def safe_read(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+def write(path, value):
+    path.write_text(str(value) + "\n")
+
+
+def safe_write(path, value):
+    try:
+        Path(path).write_text(str(value) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def ideapad(name):
+    for dev in sorted((SYS / "bus/platform/drivers/ideapad_acpi").glob("VPC2004:*")):
+        if (dev / name).exists():
+            return dev / name
+    return None
+
+
+def platform_profile_nodes():
+    """The Lenovo class device if present, else the legacy ACPI file, else any class device."""
+    found = []
+    for d in (SYS / "class/platform-profile").glob("platform-profile-*"):
+        p, c = d / "profile", d / "choices"
+        if p.exists() and c.exists():
+            name = (safe_read(d / "name") or "").lower()
+            other = not any(k in name for k in ("lenovo", "ideapad", "legion"))
+            found.append((other, "custom" not in (safe_read(c) or "").split(), d.name, p, c))
+    found.sort()
+    if found and not found[0][0]:
+        return [(found[0][3], found[0][4])]
+    legacy_p = SYS / "firmware/acpi/platform_profile"
+    legacy_c = SYS / "firmware/acpi/platform_profile_choices"
+    if legacy_p.exists() and legacy_c.exists():
+        return [(legacy_p, legacy_c)]
+    return [(f[3], f[4]) for f in found]
+
+
+def custom_profile_node():
+    """The class device that accepts "custom". The legacy ACPI file rejects it since kernel 6.14."""
+    dirs = sorted((SYS / "class/platform-profile").glob("platform-profile-*"),
+                  key=lambda p: (not any(k in (safe_read(p / "name") or "").lower()
+                                         for k in ("lenovo", "ideapad", "legion")), p.name))
+    for d in dirs:
+        if "custom" in (safe_read(d / "choices") or "").split():
+            return d / "profile"
+    return None
+
+
+def wmi_fan_targets():
+    """Fan RPM targets of the mainline lenovo_wmi_other driver. Writing 0 means automatic."""
+    out = []
+    for hw in lenovo_hwmon_dirs():
+        if safe_read(hw / "name") == "lenovo_wmi_other":
+            out.extend(sorted(hw.glob("fan*_target")))
+    return out
+
+
+def nvidia_smi(*args):
+    exe = shutil.which("nvidia-smi", path=CLEAN_ENV["PATH"])
+    if not exe:
+        return None
+    return subprocess.run([exe, *args], capture_output=True, text=True,
+                          errors="replace", env=CLEAN_ENV, check=False)
+
+
+def legion_fan_nodes():
+    nodes = []
+    for base in (SYS / "module/legion_laptop/drivers", SYS / "devices/platform"):
+        if base.exists():
+            nodes.extend(sorted(base.glob("**/fan_fullspeed")))
+    seen, out = set(), []
+    for n in nodes:
+        r = str(n)
+        if r not in seen and n.exists():
+            seen.add(r)
+            out.append(n)
+    return out
+
+
+def lenovo_hwmon_dirs():
+    out = []
+    for hw in sorted((SYS / "class/hwmon").glob("hwmon*")):
+        name = (safe_read(hw / "name") or "").lower()
+        if any(k in name for k in ("legion", "lenovo", "ideapad")):
+            out.append(hw)
+    return out
+
+
+def set_charge(mode):
+    if mode not in CHARGE_MODES:
+        raise Fail("Unknown charge mode.")
+    for bat in sorted((SYS / "class/power_supply").glob("BAT*")):
+        node = bat / "charge_types"
+        if not node.exists():
+            continue
+        try:
+            listed = read(node).replace("[", "").replace("]", "").split()
+        except OSError:
+            listed = ["Standard", "Long_Life", "Fast"]  # unreadable: both modes are on
+        if mode not in listed:
+            raise Fail(f"{mode} is not supported by this battery.")
+        write(node, mode)
+        if f"[{mode}]" not in read(node):
+            raise Fail("The firmware did not accept the charge mode.")
+        return
+    node = ideapad("conservation_mode")
+    if node is None or mode == "Fast":
+        raise Fail(f"{mode} is not supported on this machine.")
+    value = "1" if mode == "Long_Life" else "0"
+    write(node, value)
+    if read(node) != value:
+        raise Fail("The firmware did not accept the charge mode.")
+
+
+OTHER_GUID = "DC2A8805-3A8C-41BA-A6F7-092E0089CD3B"
+ACPI_CALL = Path("/proc/acpi/call")
+ACPI_LOCK = Path("/run/loq-center-acpi.lock")
+FULL_SPEED_ID = "0x04020000"  # Lenovo "Other Method" feature: fan full speed
+FAN_RPM_IDS = ("0x04030001", "0x04030002")  # current RPM of fan 1 and fan 2
+
+
+def wmi_method(guid):
+    """ACPI path of a Lenovo WMI method block, such as \\_SB_.GZFD.WMAE, or None."""
+    if safe_read(SYS / "class/dmi/id/sys_vendor") != "LENOVO":
+        return None
+    for dev in sorted((SYS / "bus/wmi/devices").glob(guid + "*")):
+        object_id = safe_read(dev / "object_id") or ""
+        if not re.fullmatch(r"[A-Z0-9]{2}", object_id):
+            continue
+        for parent in dev.resolve().parents:
+            path = safe_read(parent / "firmware_node/path")
+            if path and re.fullmatch(r"\\[A-Z0-9_.]+", path):
+                return f"{path}.WM{object_id}"
+    return None
+
+
+def other_method():
+    return wmi_method(OTHER_GUID)
+
+
+def acpi_call(command):
+    if not ACPI_CALL.exists():
+        subprocess.run(["/usr/bin/modprobe", "acpi_call"], capture_output=True,
+                       env=CLEAN_ENV, check=False)
+    if not ACPI_CALL.exists():
+        return None
+    # /proc/acpi/call holds one reply for everybody: keep each write and read together
+    with open(ACPI_LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not safe_write(ACPI_CALL, command):
+            return None
+        reply = safe_read(ACPI_CALL)
+    return reply.strip("\x00\n ") if reply else None
+
+
+def full_speed_get(method):
+    """0 or 1, or None when the firmware does not give a clear answer."""
+    reply = acpi_call(f"{method} 0x0 0x11 {FULL_SPEED_ID}")
+    return int(reply, 16) if reply in ("0x0", "0x1") else None
+
+
+def full_speed_set(method, value):
+    # Argument buffer: feature id then value, both 32-bit little endian
+    acpi_call(f"{method} 0x0 0x12 b00000204{int(value):02x}000000")
+    return full_speed_get(method) == value
+
+
+def fan_rpm(method):
+    speeds = []
+    for feature in FAN_RPM_IDS:
+        try:
+            value = int(acpi_call(f"{method} 0x0 0x11 {feature}") or "", 16)
+        except ValueError:
+            continue
+        if 0 <= value <= 10000:
+            speeds.append(value)
+    return speeds
+
+
+def watch_fans():
+    """Prints the fan speeds every 2 seconds until the app closes its end of the pipe. Read only."""
+    method = other_method()
+    if not method or not fan_rpm(method):
+        raise Fail("Fan speed is not available through acpi_call on this machine.")
+    try:
+        while True:
+            print(json.dumps(fan_rpm(method)), flush=True)
+            time.sleep(2)
+    except BrokenPipeError:
+        os._exit(0)
+
+
+def set_fans_full(state):
+    """Tries each full-speed interface and returns the name of the one that confirmed it."""
+    for node in legion_fan_nodes():
+        if safe_write(node, "1") and safe_read(node) == "1":
+            return "legion_laptop"
+    method = other_method()
+    if method:
+        before = full_speed_get(method)
+        if before is not None:
+            state.setdefault("acpi_fan", before)
+            if full_speed_set(method, 1):
+                return "acpi_call"
+    done = False
+    for target in wmi_fan_targets():
+        top = safe_read(target.with_name(target.name.replace("_target", "_max")))
+        if top and safe_write(target, top):
+            done = True
+    return "lenovo_wmi_other" if done else None
+
+
+def power_limits():
+    """Custom-mode CPU and GPU wattage settings. Temperature and time limits are left alone."""
+    found = []
+    for attr in sorted((SYS / "class/firmware-attributes").glob("lenovo-wmi-other*/attributes/*")):
+        name = attr.name
+        if name.startswith(("ppt_", "gpu_nv_", "dgpu_")) and not name.endswith(("tau", "temp", "clk")):
+            found.append(attr)
+    return found
+
+
+def set_power_limits(bound):
+    """Writes each limit's firmware minimum or maximum. Returns how many were confirmed."""
+    count = 0
+    for attr in power_limits():
+        value = safe_read(attr / bound)
+        if value is not None and safe_write(attr / "current_value", value) \
+                and safe_read(attr / "current_value") == value:
+            count += 1
+    return count
+
+
+def nvidia_present():
+    return any(safe_read(dev / "vendor") == "0x10de" and (safe_read(dev / "class") or "").startswith("0x03")
+               for dev in (SYS / "bus/pci/devices").glob("*"))
+
+
+def _collect_cooling_state():
+    state = {"files": {}, "policies": {}, "rapl": {}, "wmi_other": {}}
+
+    for p in [SYS / "devices/system/cpu/intel_pstate/no_turbo",
+              SYS / "devices/system/cpu/intel_pstate/max_perf_pct",
+              SYS / "devices/system/cpu/cpufreq/boost"]:
+        val = safe_read(p)
+        if val is not None:
+            state["files"][str(p)] = val
+
+    for pol in sorted((SYS / "devices/system/cpu/cpufreq").glob("policy*")):
+        entry = {}
+        for k in ("scaling_governor", "energy_performance_preference", "scaling_max_freq"):
+            v = safe_read(pol / k)
+            if v is not None:
+                entry[k] = v
+        if entry:
+            state["policies"][str(pol)] = entry
+
+    for cap in sorted((SYS / "class/powercap").glob("intel-rapl*")):
+        if cap.name.count(":") > 1:
+            continue
+        c0 = safe_read(cap / "constraint_0_power_limit_uw")
+        c1 = safe_read(cap / "constraint_1_power_limit_uw")
+        if c0 is not None or c1 is not None:
+            state["rapl"][str(cap)] = {"c0": c0, "c1": c1}
+
+    for p in sorted((SYS / "class/drm").glob("card*/gt_max_freq_mhz")) + \
+             sorted((SYS / "class/drm").glob("card*/gt_boost_freq_mhz")) + \
+             sorted((SYS / "class/drm").glob("card*/gt/gt*/rps_max_freq_mhz")) + \
+             sorted((SYS / "class/drm").glob("card*/gt/gt*/rps_boost_freq_mhz")) + \
+             sorted((SYS / "class/drm").glob("card*/device/power_dpm_force_performance_level")):
+        v = safe_read(p)
+        if v is not None:
+            state["files"][str(p)] = v
+
+    for n in legion_fan_nodes():
+        v = safe_read(n)
+        if v is not None:
+            state["files"][str(n)] = v
+
+    state["fan_targets"] = {str(p): safe_read(p) or "0" for p in wmi_fan_targets()}
+    return state
+
+
+def _enter_custom(custom, state):
+    """Switches to Custom (purple) and remembers its own power limits the first time."""
+    if not safe_write(custom, "custom"):
+        return False
+    time.sleep(0.5)
+    if safe_read(custom) != "custom":
+        return False
+    if not state.get("wmi_from_custom"):
+        for attr in power_limits():
+            value = safe_read(attr / "current_value")
+            if value is not None:
+                state["wmi_other"][str(attr / "current_value")] = value
+        state["wmi_from_custom"] = True
+    return True
+
+
+def _save_state(state):
+    COOLING_STATE.write_text(json.dumps(state))
+    os.chmod(COOLING_STATE, 0o644)
+
+
+def _restore_cooling():
+    if not COOLING_STATE.exists():
+        return
+    try:
+        state = json.loads(COOLING_STATE.read_text())
+    except (OSError, ValueError):
+        COOLING_STATE.unlink(missing_ok=True)
+        return
+
+    # Fan and power settings of Custom mode can only be put back while in Custom mode
+    custom = custom_profile_node()
+    if state.get("wmi_from_custom") and custom is not None and safe_write(custom, "custom"):
+        time.sleep(0.5)
+
+    if "acpi_fan" in state:
+        method = other_method()
+        if method and not full_speed_set(method, state["acpi_fan"]):
+            print("Warning: could not confirm that fan full speed was switched off.", file=sys.stderr)
+
+    for path_str, val in state.get("files", {}).items():
+        safe_write(path_str, val)
+
+    saved_targets = state.get("fan_targets", {})
+    for target in wmi_fan_targets():
+        safe_write(target, saved_targets.get(str(target), "0"))
+
+    if state.get("nvidia_locked"):
+        nvidia_smi("-rgc")
+
+    for pol_str, vals in state.get("policies", {}).items():
+        pol = Path(pol_str)
+        for k in ("scaling_governor", "energy_performance_preference", "scaling_max_freq"):
+            if k in vals:
+                safe_write(pol / k, vals[k])
+
+    for cap_str, vals in state.get("rapl", {}).items():
+        cap = Path(cap_str)
+        if vals.get("c0") is not None:
+            if not safe_write(cap / "constraint_0_power_limit_uw", vals["c0"]):
+                mx = safe_read(cap / "constraint_0_max_power_uw")
+                if mx and mx != "0":
+                    safe_write(cap / "constraint_0_power_limit_uw", mx)
+        if vals.get("c1") is not None:
+            safe_write(cap / "constraint_1_power_limit_uw", vals["c1"])
+
+    for path_str, val in state.get("wmi_other", {}).items():
+        safe_write(path_str, val)
+
+    COOLING_STATE.unlink(missing_ok=True)
+
+
+def _require_custom(title):
+    custom = custom_profile_node()
+    if custom is None:
+        raise Fail(f"{title} needs Custom (purple) mode, but this kernel does not offer it. "
+                   "Nothing was changed. Check: cat /sys/class/platform-profile/*/choices")
+    return custom
+
+
+def _apply_cooling():
+    custom = _require_custom("Cooling")
+    state = None
+    if COOLING_STATE.exists():
+        try:
+            state = json.loads(COOLING_STATE.read_text())
+        except (OSError, ValueError):
+            state = None
+        if state is None or state.get("mode", "cooling") != "cooling":
+            _restore_cooling()
+            state = None
+    if state is None:
+        state = _collect_cooling_state()
+
+    # 1. Custom mode first: fan and power settings only work there. Never Performance.
+    if not _enter_custom(custom, state):
+        raise Fail("The firmware refused Custom (purple) mode. Performance mode was not selected.")
+    state.update(mode="cooling", fans_direct=False, applied_profile="custom")
+    _save_state(state)  # saved early, so another mode can always undo a partial change
+
+    # 2. Lowest firmware power limits for CPU and GPU
+    limits = set_power_limits("min_value")
+
+    # 3. Low CPU clocks
+    time.sleep(0.5)  # let power daemons react to the mode change before capping the CPU
+    cpu_capped = any([
+        safe_write(SYS / "devices/system/cpu/intel_pstate/no_turbo", "1"),
+        safe_write(SYS / "devices/system/cpu/cpufreq/boost", "0"),
+        safe_write(SYS / "devices/system/cpu/intel_pstate/max_perf_pct", "55"),
+    ])
+
+    for pol in sorted((SYS / "devices/system/cpu/cpufreq").glob("policy*")):
+        govs = (safe_read(pol / "scaling_available_governors") or "").split()
+        for g in ("powersave", "conservative", "schedutil"):
+            if g in govs and safe_write(pol / "scaling_governor", g):
+                break
+        epps = (safe_read(pol / "energy_performance_available_preferences") or "").split()
+        for e in ("power", "balance_power"):
+            if e in epps and safe_write(pol / "energy_performance_preference", e):
+                break
+        if safe_read(pol / "scaling_driver") != "intel_pstate":
+            try:
+                mn = int(safe_read(pol / "cpuinfo_min_freq") or 0)
+                mx = int(safe_read(pol / "cpuinfo_max_freq") or 0)
+                if mx > mn > 0:
+                    safe_write(pol / "scaling_max_freq", str(max(mn, int(mx * 0.55))))
+            except ValueError:
+                pass
+
+    for cap in sorted((SYS / "class/powercap").glob("intel-rapl*")):
+        if cap.name.count(":") > 1:
+            continue
+        if (cap / "constraint_0_power_limit_uw").exists():
+            try:
+                mx0 = int(safe_read(cap / "constraint_0_max_power_uw") or 0)
+                pl1 = 25_000_000 if mx0 <= 0 else max(15_000_000, min(25_000_000, mx0))
+                safe_write(cap / "constraint_0_power_limit_uw", str(pl1))
+            except ValueError:
+                pass
+        if (cap / "constraint_1_power_limit_uw").exists():
+            try:
+                mx1 = int(safe_read(cap / "constraint_1_max_power_uw") or 0)
+                pl2 = 35_000_000 if mx1 <= 0 else max(20_000_000, min(35_000_000, mx1))
+                safe_write(cap / "constraint_1_power_limit_uw", str(pl2))
+            except ValueError:
+                pass
+
+    # 4. Low GPU clocks
+    for card in sorted((SYS / "class/drm").glob("card*")):
+        if "-" in card.name:
+            continue
+        rpn = safe_read(card / "gt_RPn_freq_mhz")
+        rp1 = safe_read(card / "gt_RP1_freq_mhz")
+        if rpn or rp1:
+            try:
+                low_mhz = max(int(rpn or 300), int(rp1 or 450))
+                for fn in ("gt_max_freq_mhz", "gt_boost_freq_mhz"):
+                    if (card / fn).exists():
+                        safe_write(card / fn, str(low_mhz))
+                for gt in sorted(card.glob("gt/gt*")):
+                    for fn in ("rps_max_freq_mhz", "rps_boost_freq_mhz"):
+                        if (gt / fn).exists():
+                            safe_write(gt / fn, str(low_mhz))
+            except ValueError:
+                pass
+        amd_dpm = card / "device/power_dpm_force_performance_level"
+        if amd_dpm.exists():
+            safe_write(amd_dpm, "low")
+
+    if nvidia_present():
+        res = nvidia_smi("-lgc", "210,900")  # wakes a sleeping GPU once
+        if res and res.returncode == 0:
+            state["nvidia_locked"] = True
+
+    # 5. Fans at full speed, last so that nothing above resets them
+    fans = set_fans_full(state)
+    state["fans_direct"] = bool(fans)
+    _save_state(state)
+
+    if safe_read(custom) != "custom":
+        raise Fail("Another power service moved the laptop out of Custom mode. Click Cooling again.")
+    fan_text = f"fans FULL ({fans})" if fans else "FANS NOT AT FULL SPEED (no working fan interface)"
+    cpu = "CPU capped" if cpu_capped else "CPU cap refused"
+    gpu = "GPU capped" if state.get("nvidia_locked") else "NVIDIA cap not confirmed"
+    print(f"Cooling [custom/purple]: {fan_text}; {cpu}; {gpu}; {limits} firmware limits at minimum.")
+
+
+def on_battery():
+    for dev in (SYS / "class/power_supply").glob("*"):
+        if safe_read(dev / "type") == "Mains":
+            return safe_read(dev / "online") == "0"
+    return False
+
+
+def _write_profile(name):
+    nodes = platform_profile_nodes()
+    if nodes:
+        wrote = False
+        for node, choices_node in nodes:
+            choices = (safe_read(choices_node) or "").split()
+            if name == "custom" or name not in choices:
+                continue
+            write(node, name)
+            if read(node) != name:
+                raise Fail("The firmware did not accept the mode (is the charger connected?).")
+            wrote = True
+        if not wrote:
+            raise Fail("That performance mode is not supported.")
+    elif name in PPD_NAMES:
+        ppd = shutil.which("powerprofilesctl", path=CLEAN_ENV["PATH"])
+        if not ppd:
+            raise Fail("No platform profile driver or powerprofilesctl found.")
+        done = subprocess.run([ppd, "set", PPD_NAMES[name]], capture_output=True,
+                              text=True, env=CLEAN_ENV, check=False)
+        if done.returncode != 0:
+            raise Fail(done.stderr.strip() or "powerprofilesctl refused the mode.")
+    else:
+        raise Fail("That performance mode is not supported.")
+
+
+def _apply_max_power():
+    if on_battery():
+        raise Fail("Plug in the charger before using Max power.")
+    nodes = platform_profile_nodes()
+    choices = (safe_read(nodes[0][1]) or "").split() if nodes else []
+    if "max-power" in choices:  # the firmware's own Extreme mode (purple)
+        _restore_cooling()
+        _write_profile("max-power")
+        print("Max power [max-power/purple]: firmware Extreme mode is on.")
+        return
+
+    custom = _require_custom("Max power")
+    _restore_cooling()
+    state = _collect_cooling_state()
+    if not _enter_custom(custom, state):
+        raise Fail("The firmware refused Custom (purple) mode. Performance mode was not selected.")
+    state.update(mode="max-power", applied_profile="custom")
+    _save_state(state)
+    limits = set_power_limits("max_value")
+    time.sleep(0.5)
+    safe_write(SYS / "devices/system/cpu/intel_pstate/no_turbo", "0")
+    safe_write(SYS / "devices/system/cpu/cpufreq/boost", "1")
+    safe_write(SYS / "devices/system/cpu/intel_pstate/max_perf_pct", "100")
+    for pol in sorted((SYS / "devices/system/cpu/cpufreq").glob("policy*")):
+        if "performance" in (safe_read(pol / "scaling_available_governors") or "").split():
+            safe_write(pol / "scaling_governor", "performance")
+        safe_write(pol / "energy_performance_preference", "performance")
+    detail = (f"{limits} firmware power limits at maximum" if limits else
+              "NO firmware power limits available, so Custom mode keeps its stored wattage")
+    print(f"Max power [custom/purple]: {detail}; CPU unrestricted.")
+
+
+def _apply_ultra_saver():
+    """Quiet mode plus a CPU cap. Saved like Cooling, so any other mode puts everything back.
+
+    Leaves the NVIDIA GPU and the fans alone: no clock lock (that would wake a sleeping GPU)."""
+    nodes = platform_profile_nodes()
+    choices = (safe_read(nodes[0][1]) or "").split() if nodes else []
+    quiet = next((c for c in ("low-power", "quiet") if c in choices), "low-power")
+    _restore_cooling()  # undo Cooling, Max power or an earlier Ultra saver first
+    state = _collect_cooling_state()
+    _write_profile(quiet)  # raises Fail when this machine has no quiet mode
+    state.update(mode="ultra-saver", applied_profile=quiet)
+    _save_state(state)  # saved early, so another mode can always undo a partial change
+    time.sleep(0.5)  # let power daemons react to the mode change before capping the CPU
+    capped = any([
+        safe_write(SYS / "devices/system/cpu/intel_pstate/no_turbo", "1"),
+        safe_write(SYS / "devices/system/cpu/cpufreq/boost", "0"),
+        safe_write(SYS / "devices/system/cpu/intel_pstate/max_perf_pct", "50"),
+    ])
+    for pol in sorted((SYS / "devices/system/cpu/cpufreq").glob("policy*")):
+        govs = (safe_read(pol / "scaling_available_governors") or "").split()
+        for g in ("powersave", "conservative", "schedutil"):
+            if g in govs and safe_write(pol / "scaling_governor", g):
+                break
+        epps = (safe_read(pol / "energy_performance_available_preferences") or "").split()
+        if "power" in epps:
+            safe_write(pol / "energy_performance_preference", "power")
+        if safe_read(pol / "scaling_driver") != "intel_pstate":
+            try:
+                mn = int(safe_read(pol / "cpuinfo_min_freq") or 0)
+                mx = int(safe_read(pol / "cpuinfo_max_freq") or 0)
+                if mx > mn > 0:
+                    safe_write(pol / "scaling_max_freq", str(max(mn, int(mx * 0.5))))
+            except ValueError:
+                pass
+    cpu = "CPU capped (no turbo, about half speed)" if capped else "CPU cap refused by this kernel"
+    print(f"Ultra saver [{quiet}]: {cpu}.")
+
+
+def set_profile(name):
+    if name == "ultra-saver":
+        _apply_ultra_saver()
+    elif name == "cooling":
+        _apply_cooling()
+    elif name == "max-power":
+        _apply_max_power()
+    else:
+        _restore_cooling()
+        _write_profile(name)
+
+
+def set_toggle(name, value):
+    if name not in TOGGLES or value not in ("0", "1"):
+        raise Fail("Unknown switch or value.")
+    node = ideapad(name)
+    if node is None:
+        raise Fail("This machine does not have that switch.")
+    write(node, value)
+    if read(node) != value:
+        raise Fail("The firmware did not accept the change.")
+
+
+def panel_on_nvidia():
+    drm = SYS / "class/drm"
+    for connector in drm.glob("card*-eDP-*"):
+        try:
+            if read(connector / "status") != "connected":
+                continue
+            if read(drm / connector.name.split("-")[0] / "device/vendor") == "0x10de":
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def envy(*args):
+    return subprocess.run([ENVYCONTROL, *args], capture_output=True, text=True,
+                          errors="replace", env=CLEAN_ENV, check=False)
+
+
+def panel_mode():
+    """Which GPU drives the built-in screen right now: "hybrid", "dgpu" or None."""
+    drm = SYS / "class/drm"
+    vendors = set()
+    for connector in drm.glob("card*-eDP-*"):
+        if safe_read(connector / "status") == "connected":
+            vendors.add(safe_read(drm / connector.name.split("-")[0] / "device/vendor"))
+    return {("0x10de",): "dgpu", ("0x8086",): "hybrid"}.get(tuple(vendors))
+
+
+def mux_read(method, method_id):
+    reply = acpi_call(f"{method} 0x0 0x{method_id:02x} b00000000")
+    return int(reply, 16) if reply in ("0x0", "0x1") else None
+
+
+def mux_firmware():
+    """(method path, "hybrid" or "dgpu") when the firmware reports a switchable MUX."""
+    method = wmi_method(GAMEZONE_GUID)
+    if method is None or mux_read(method, MUX_SUPPORTED) != 1:
+        return None, None
+    value = mux_read(method, MUX_GET)
+    return method, next((name for name, number in MUX_MODES.items() if number == value), None)
+
+
+def dgpu_blocker():
+    """Why dGPU only could leave a black screen right now, or None."""
+    if on_battery():
+        return "Plug in the charger first."
+    if safe_read(SYS / "module/nvidia_drm/parameters/modeset") != "Y":
+        return ("The NVIDIA display driver is not ready (nvidia_drm modeset is not on). "
+                "The screen could stay black.")
+    words = (safe_read(CMDLINE) or "").split()
+    if "nomodeset" in words:
+        return "The kernel option nomodeset is set. Remove it and reboot first."
+    if Path(ENVYCONTROL).exists() and envy("--query").stdout.strip() == "integrated":
+        return "NVIDIA is set to Integrated (off). Switch to Hybrid, reboot, then try again."
+    return None
+
+
+def mux_report():
+    """Read-only check for the terminal. Changes nothing."""
+    method, firmware = mux_firmware()
+    print(json.dumps({"supported": method is not None, "firmware": firmware,
+                      "screen": panel_mode(), "pending": safe_read(MUX_PENDING),
+                      "dgpu_check": dgpu_blocker() or "ok"}))
+
+
+def set_mux(mode):
+    if mode not in MUX_MODES:
+        raise Fail("Unknown display mode.")
+    method, firmware = mux_firmware()
+    if method is None:
+        raise Fail("The firmware did not report a switchable display (check that acpi_call "
+                   f"is loaded). Nothing was changed. {BIOS_HINT}")
+    screen = panel_mode()
+    if firmware is None or screen is None:
+        raise Fail(f"Could not read the current display mode. Nothing was changed. {BIOS_HINT}")
+    pending = safe_read(MUX_PENDING)
+    if pending is None and firmware != screen:
+        # Either a change is waiting for a reboot, or this model answers differently
+        raise Fail(f"The firmware says {MUX_LABELS[firmware]} but the screen is on "
+                   f"{MUX_LABELS[screen]}. Nothing was changed. Reboot first. {BIOS_HINT}")
+    if mode == "dgpu":
+        blocker = dgpu_blocker()
+        if blocker:
+            raise Fail(f"{blocker} Nothing was changed.")
+    if pending is None and mode == screen:
+        print(f"Already in {MUX_LABELS[mode]}.")
+        return
+    for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGPIPE):
+        signal.signal(sig, signal.SIG_IGN)
+    # Remember the request first, so a half finished switch still blocks Integrated
+    MUX_PENDING.write_text(mode + "\n")
+    MUX_PENDING.chmod(0o644)
+    reply = acpi_call(f"{method} 0x0 0x{MUX_SET:02x} b{MUX_MODES[mode]:02x}000000")
+    after = mux_read(method, MUX_GET)
+    if reply is not None and reply.startswith("Error"):
+        if pending:
+            MUX_PENDING.write_text(pending + "\n")
+        elif after == MUX_MODES[screen]:
+            MUX_PENDING.unlink(missing_ok=True)
+        raise Fail(f"The firmware refused the switch. {BIOS_HINT}")
+    if mode == screen and after == MUX_MODES[mode]:
+        MUX_PENDING.unlink(missing_ok=True)
+        print(f"Change cancelled. The screen stays on {MUX_LABELS[mode]}.")
+        return
+    proof = ("The firmware confirms it." if after == MUX_MODES[mode]
+             else "The firmware has not confirmed it yet; check again after reboot.")
+    print(f"{MUX_LABELS[mode]} requested. {proof} Reboot to apply.")
+
+
+def set_gpu(mode):
+    if mode not in GPU_MODES:
+        raise Fail("Unknown GPU mode.")
+    if not Path(ENVYCONTROL).exists():
+        raise Fail("envycontrol is not installed.")
+    if mode == "integrated" and panel_on_nvidia():
+        raise Fail("Blocked: the built-in screen is wired to NVIDIA. Switch to Hybrid and reboot first.")
+    if mode == "integrated" and (safe_read(MUX_PENDING) == "dgpu" or mux_firmware()[1] == "dgpu"):
+        raise Fail("Blocked: dGPU only is selected for the next boot. Pick Hybrid and reboot first.")
+    for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGPIPE):
+        signal.signal(sig, signal.SIG_IGN)
+    done = envy("-s", mode, *GPU_MODES[mode])
+    output = f"{done.stdout}\n{done.stderr}"
+    errors = [line for line in output.splitlines() if "ERROR" in line]
+    now = envy("--query").stdout.strip()
+    if done.returncode != 0 or errors or now != mode:
+        detail = "\n".join(errors or output.strip().splitlines()[-8:])
+        raise Fail(f"GPU switch had a problem. Do not reboot until it is fixed.\n{detail}\n"
+                   "To go back: sudo envycontrol -s hybrid")
+    print(f"GPU mode set to {mode}. Reboot to apply.")
+
+
+def main(argv):
+    try:
+        match argv[1:]:
+            case ["set", "charge", mode]:
+                with exclusive():
+                    set_charge(mode)
+            case ["set", "profile", name]:
+                if name in HEAVY_PROFILES:
+                    raise Fail(f"{name} needs the power action.")
+                with exclusive():
+                    set_profile(name)
+            case ["power", "profile", name]:
+                if name not in HEAVY_PROFILES:
+                    raise Fail("Unknown power mode.")
+                with exclusive():
+                    set_profile(name)
+            case ["set", "toggle", name, value]:
+                with exclusive():
+                    set_toggle(name, value)
+            case ["watch", "fans"]:
+                watch_fans()
+            case ["watch", "mux"]:
+                mux_report()
+            case ["gpu", "mux", mode]:
+                with exclusive():
+                    set_mux(mode)
+            case ["gpu", mode]:
+                with exclusive():
+                    set_gpu(mode)
+            case _:
+                print("Usage: set charge|profile|toggle ... | power profile cooling|max-power | "
+                      "gpu integrated|hybrid | gpu mux dgpu|hybrid", file=sys.stderr)
+                return 2
+    except Fail as err:
+        print(err, file=sys.stderr)
+        return 3
+    except OSError as err:
+        print(f"System refused the change: {err}", file=sys.stderr)
+        return 4
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
