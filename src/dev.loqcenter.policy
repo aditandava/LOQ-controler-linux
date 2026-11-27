@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <action id="dev.loqcenter.set">
+    <description>Change LOQ battery, performance and device switches</description>
+    <message>Authentication is required to change laptop settings</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/loq-center-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">set</annotate>
+  </action>
+  <action id="dev.loqcenter.watch">
+    <description>Read LOQ fan speeds</description>
+    <message>Authentication is required to read the fan speeds</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/loq-center-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">watch</annotate>
+  </action>
+  <action id="dev.loqcenter.gpu">
+    <description>Switch LOQ graphics mode</description>
+    <message>Authentication is required to switch the graphics mode</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/loq-center-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">gpu</annotate>
+  </action>
+</policyconfig>
