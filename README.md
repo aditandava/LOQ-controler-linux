@@ -1,5 +1,5 @@
 # LOQ Center for Linux
-
+###Developed using claude ai
 A control panel for Lenovo LOQ / Legion laptops, built for Arch / EndeavourOS with Hyprland and HyDE.
 Manage performance, battery, display, GPU mode and the optional 4-zone RGB keyboard from one window.
 
