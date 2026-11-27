@@ -179,6 +179,12 @@ install_fan_module() {
 install_fan_module
 sudo modprobe acpi_call 2>/dev/null || say "acpi_call did not load (reboot, or check Secure Boot)."
 
+# If we have the project source locally and python3 tools/build.py exists, rebuild fresh binaries
+if [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/tools/build.py" ]; then
+  say "Rebuilding app binaries from section files..."
+  python3 "$SELF_DIR/tools/build.py" || true
+fi
+
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
@@ -243,7 +249,6 @@ Terminal=false
 Categories=Settings;HardwareSettings;
 StartupWMClass=loq-center
 DESKTOP_EOF
-
 if [ -d "$CONFIG/hyde" ]; then
   say "Adding the HyDE wallbash theme"
   install -Dm644 "$work/loq-center.dcol" "$DCOL"
