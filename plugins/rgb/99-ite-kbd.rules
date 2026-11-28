@@ -1,0 +1,39 @@
+# ITE keyboard controllers (Lenovo LOQ / Legion / IdeaPad Gaming)
+# All known 4-zone RGB keyboard PIDs (2020–2024 + new reports)
+# Edit freely — rgb.py reads PIDs from this file automatically.
+
+# 2024 models
+SUBSYSTEM=="usb", ATTR{idVendor}=="048d", ATTR{idProduct}=="c995", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="048d", ATTR{idProduct}=="c994", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="048d", ATTR{idProduct}=="c993", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="c995", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="c994", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="c993", TAG+="uaccess"
+
+# 2023 models
+SUBSYSTEM=="usb", ATTR{idVendor}=="048d", ATTR{idProduct}=="c985", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="048d", ATTR{idProduct}=="c984", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="048d", ATTR{idProduct}=="c983", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="c985", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="c984", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="c983", TAG+="uaccess"
+
+# 2022 models
+SUBSYSTEM=="usb", ATTR{idVendor}=="048d", ATTR{idProduct}=="c975", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="048d", ATTR{idProduct}=="c973", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="c975", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="c973", TAG+="uaccess"
+
+# 2021 models
+SUBSYSTEM=="usb", ATTR{idVendor}=="048d", ATTR{idProduct}=="c965", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="048d", ATTR{idProduct}=="c963", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="c965", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="c963", TAG+="uaccess"
+
+# 2020 models
+SUBSYSTEM=="usb", ATTR{idVendor}=="048d", ATTR{idProduct}=="c955", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", ATTRS{idProduct}=="c955", TAG+="uaccess"
+
+# Generic ITE catch-all (optional; uncomment both lines if your PID is not listed above)
+# SUBSYSTEM=="usb", ATTR{idVendor}=="048d", TAG+="uaccess"
+# SUBSYSTEM=="hidraw", ATTRS{idVendor}=="048d", TAG+="uaccess"

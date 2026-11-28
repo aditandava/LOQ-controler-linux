@@ -1,0 +1,22 @@
+# Installer -> loq_controller_install.sh
+# One part file per line, joined in this order by tools/build.py.
+header.sh
+lib/output.sh
+lib/download.sh
+lib/desktop.sh
+lib/remove_hooks.sh
+uninstall.sh
+deps/pacman.sh
+deps/apt.sh
+deps/dnf.sh
+deps/zypper.sh
+deps/other.sh
+deps/run.sh
+deps/acpi_call.sh
+app/sources.sh
+app/files.sh
+app/icon.sh
+app/desktop_entry.sh
+hyde_theme.sh
+hyprland_hooks.sh
+finish.sh
