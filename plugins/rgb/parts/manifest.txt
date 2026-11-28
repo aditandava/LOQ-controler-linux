@@ -1,0 +1,25 @@
+# LOQ RGB plugin -> plugins/rgb/rgb.py (installed as ~/.config/loq-center/plugins/rgb.py)
+# One part file per line, joined in this order by tools/build.py.
+base/header.py
+base/constants.py
+base/style.py
+state.py
+device/rules.py
+device/hidraw.py
+device/usb.py
+colors.py
+device/protocol.py
+device/transport.py
+hyde_sync.py
+tab/mode_switch/motion.py
+tab/mode_switch/icons.py
+tab/mode_switch/drawing.py
+tab/mode_switch/widget.py
+tab/controls_card.py
+tab/zones_card.py
+tab/profiles_card.py
+tab/refresh.py
+tab/actions.py
+tab/rgb_tab.py
+register.py
+cli.py
