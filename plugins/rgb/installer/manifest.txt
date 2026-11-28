@@ -1,0 +1,8 @@
+# RGB installer template -> loq_rgb.sh (@@RULES@@ and @@PLUGIN@@ are filled in)
+# One part file per line, joined in this order by tools/build.py.
+header.sh
+uninstall.sh
+pyusb.sh
+udev.sh
+plugin.sh
+finish.sh
